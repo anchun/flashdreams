@@ -231,6 +231,14 @@ def test_camera_selection_preserves_other_explicit_options(tmp_path, selection):
     assert app._backend._settings.compile_denoise == "default"
 
 
+def test_experimental_chunk_frames_reaches_the_interactive_backend(tmp_path):
+    app = create_app()
+    app.init(["--scene", str(tmp_path), "--chunk-frames", "1"])
+
+    assert isinstance(app._backend, MultiViewRenderBackend)
+    assert app._backend._settings.frames_per_chunk == 1
+
+
 @pytest.mark.parametrize(
     "args,message",
     [
@@ -239,6 +247,7 @@ def test_camera_selection_preserves_other_explicit_options(tmp_path, selection):
         (["--views", "8"], "invalid choice"),
         (["--views", "7", "--camera", CAMERAS[0]], "not allowed"),
         ([f"--camera={CAMERAS[0]}", "--views=1"], "not allowed"),
+        (["--chunk-frames", "0"], "--chunk-frames must be positive"),
     ],
 )
 def test_invalid_camera_presets_fail_before_preparing_assets(

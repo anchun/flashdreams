@@ -118,6 +118,19 @@ Start with one front-wide view:
 ```bash
 uv run --no-sync flashdreams-run-v2 interactive-drive-cosmos3-nano-sim-auto \
   --mode webrtc --host 0.0.0.0 --port 8080
+
+# run with two GPUs and set chunk-frames 1
+export CUDA_VISIBLE_DEVICES=0,1
+uv run --no-sync torchrun --standalone --nproc_per_node=2 --no-python \
+ flashdreams-run-v2 interactive-drive-cosmos3-nano-sim-auto  \
+ --mode websocket --host 0.0.0.0 --port 60089 --   --views 1 --chunk-frames 1
+
+# compile-denoise for extra performance
+COSMOS3_NANO_SIM_AUTO_TENSOR_PARALLEL=1 uv run --no-sync torchrun --standalone \
+ --nproc_per_node=2 --no-python   flashdreams-run-v2 interactive-drive-cosmos3-nano-sim-auto \
+ --mode websocket --host 0.0.0.0 --port 60089 --   --views 1 --parallel-decode \
+ --chunk-frames 1 --compile-denoise default --no-ui
+
 ```
 
 Open `http://<server-address>:8080/`; use `localhost` when running locally.

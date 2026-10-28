@@ -222,6 +222,14 @@ class CosmosInteractiveDriveApplication(InteractiveDriveApplication):
             "COSMOS3_NANO_SIM_AUTO_TENSOR_PARALLEL=1 under torchrun",
         )
         parser.add_argument(
+            "--chunk-frames",
+            type=int,
+            default=self._settings.frames_per_chunk,
+            help="Experimental latent frames per autoregressive chunk. The "
+            "checkpoint's quality setting is 3; 1 presents four pixel frames "
+            "per chunk with unqualified quality.",
+        )
+        parser.add_argument(
             "--compile-control-encode",
             action="store_true",
             help="Run the map's control encoder under torch.compile",
@@ -253,6 +261,8 @@ class CosmosInteractiveDriveApplication(InteractiveDriveApplication):
             # The shared parser's default accepts a numeric value, while its
             # CLI converter accepts only integers. Recorded scenes may be 32.7 Hz.
             self._default_fps = args.fps
+        if args.chunk_frames < 1:
+            parser.error("--chunk-frames must be positive")
         if args.no_ui:
             shared.append("--no-ui")
         if "--help" in shared or "-h" in shared:
@@ -279,6 +289,7 @@ class CosmosInteractiveDriveApplication(InteractiveDriveApplication):
             compile_denoise=None
             if args.compile_denoise == "off"
             else args.compile_denoise,
+            frames_per_chunk=args.chunk_frames,
             parallel_decode=args.parallel_decode or self._settings.parallel_decode,
             decoder_compile=args.decoder_compile or self._settings.decoder_compile,
             compile_control_encode=args.compile_control_encode

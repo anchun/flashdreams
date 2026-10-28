@@ -6,6 +6,7 @@
 import threading
 from collections import deque
 from dataclasses import replace
+from typing import Literal
 
 from numpy import uint64
 
@@ -47,6 +48,7 @@ class WebRTCClientWindow(IClientWindow):
         host: str = "127.0.0.1",
         port: int = 0,
         startup_timeout_seconds: float = 10.0,
+        _transport: Literal["webrtc", "websocket"] = "webrtc",
     ) -> None:
         """Create the WebRTC backend.
 
@@ -57,6 +59,7 @@ class WebRTCClientWindow(IClientWindow):
             host: Interface on which the HTTP server listens.
             port: Listening port. Zero asks the operating system to choose one.
             startup_timeout_seconds: Maximum time to wait for server startup.
+            _transport: Internal browser transport selected by a concrete mode.
         """
         self._input_events: deque[UserInputEvent] = deque()
         self._file_selector_reports: deque[
@@ -71,6 +74,7 @@ class WebRTCClientWindow(IClientWindow):
             host=host,
             port=port,
             startup_timeout_seconds=startup_timeout_seconds,
+            transport=_transport,
         )
 
         def handle_input(event: UserInputEvent) -> None:

@@ -21,6 +21,7 @@ from flashdreams.runtime_v2.null_client_window import NullClientWindow
 
 if TYPE_CHECKING:
     from flashdreams.runtime_v2.webrtc_client_window import WebRTCClientWindow
+    from flashdreams.runtime_v2.websocket_client_window import WebSocketClientWindow
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -153,9 +154,26 @@ class _NativeWindowMode(ClientWindowMode):
         )
 
 
+class _WebSocketMode(ClientWindowMode):
+    """Stream the run over one TCP-only browser connection."""
+
+    name = "websocket"
+
+    def create(self, parsed_args: argparse.Namespace) -> IClientWindow:
+        from flashdreams.runtime_v2.websocket_client_window import WebSocketClientWindow
+
+        return WebSocketClientWindow(host=parsed_args.host, port=parsed_args.port)
+
+    def starting(self, client_window: IClientWindow) -> str | None:
+        """Return where to connect, including an operating-system-selected port."""
+        server = cast("WebSocketClientWindow", client_window).server
+        return f"Open {server.url} in a browser."
+
+
 _BUILTIN_MODES: tuple[ClientWindowMode, ...] = (
     _Mp4Mode(),
     _WebRTCMode(),
+    _WebSocketMode(),
     _NativeWindowMode(),
     _NullMode(),
 )

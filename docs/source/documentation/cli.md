@@ -21,7 +21,7 @@ uv run flashdreams-run-v2 <Demo Preset> <System Arguments> -- <Demo Arguments>
 | --- | --- |
 | `--timeout {SECONDS,unbound}` | Bound the whole application run, including initialization and replacement sessions. |
 | `--total-model-steps {N,unbound}` | Bound model steps across the whole application run, including replacement sessions. |
-| `--mode {mp4,webrtc,native-window}` | Select file, browser, or local-window presentation. Default: `mp4`. |
+| `--mode {mp4,webrtc,websocket,native-window}` | Select file, browser, TCP-only browser, or local-window presentation. Default: `mp4`. |
 | `--stats-path PATH` | Write JSON model-step measurements and enable synchronized per-stage pipeline profiling. |
 
 ### MP4 Specific
@@ -30,12 +30,19 @@ uv run flashdreams-run-v2 <Demo Preset> <System Arguments> -- <Demo Arguments>
 | --- | --- |
 | `--output-path PATH` | MP4 destination. Required in MP4 mode. |
 
-### WebRTC Specific
+### Browser Streaming
+
+Both `webrtc` and `websocket` modes accept these arguments:
 
 | Argument | Description |
 | --- | --- |
 | `--host HOST` | Interface to serve on. Default: `127.0.0.1`; use `0.0.0.0` for remote clients. |
 | `--port PORT` | Port to serve on. Default: `0`, which selects an available port. |
+
+Use `webrtc` for efficient video when the browser has a working ICE media path.
+Use `websocket` when only one TCP port is reachable; it sends JPEG frames and
+controls through that port. WebSocket mode supports one browser at a time and
+usually uses more bandwidth than WebRTC.
 
 ### Native Window Specific
 
@@ -58,10 +65,16 @@ These options override the default demo session values requested by a particular
 
 ### Examples
 
-Stream to a browser:
+Stream to a browser over WebRTC:
 
 ```bash
 uv run flashdreams-run-v2 DEMO_MODEL_SLUG --mode webrtc --host 0.0.0.0 --port 8089
+```
+
+Stream video and controls through one TCP WebSocket port:
+
+```bash
+uv run flashdreams-run-v2 DEMO_MODEL_SLUG --mode websocket --host 0.0.0.0 --port 8089
 ```
 
 Write every generated frame in order to an MP4:

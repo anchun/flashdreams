@@ -24,7 +24,7 @@ import torch
 from aiohttp import web
 from aiortc import MediaStreamTrack, RTCPeerConnection, RTCSessionDescription
 from aiortc.mediastreams import MediaStreamError
-from av import VideoFrame
+from av import CodecContext, VideoFrame
 from loguru import logger
 from torch.nn import functional as F
 
@@ -57,6 +57,20 @@ from flashdreams.runtime_v2.video_tensor import VideoTensorLayout
 
 _WEB_RESOURCES = files("flashdreams.runtime_v2.serving").joinpath("web")
 _BROWSER_PAGE = _WEB_RESOURCES.joinpath("index.html").read_text(encoding="utf-8")
+_WEBSOCKET_BROWSER_PAGE = (
+    _BROWSER_PAGE.replace(
+        "<title>FlashDreams WebRTC</title>",
+        "<title>FlashDreams WebSocket</title>",
+    )
+    .replace(
+        '<video id="video" autoplay muted playsinline></video>',
+        '<img id="video" alt="FlashDreams live stream">',
+    )
+    .replace(
+        '<script src="/app.js"></script>',
+        '<script src="/app.js" data-transport="websocket"></script>',
+    )
+)
 _BROWSER_SCRIPT = _WEB_RESOURCES.joinpath("app.js").read_text(encoding="utf-8")
 
 _INTERACTIVE_FRAME_QUEUE_SIZE = 2
@@ -339,6 +353,24 @@ class _FileUpload:
             self.reader.cancel()
 
 
+class _WebSocketControlChannel:
+    """Expose an aiohttp WebSocket through the data-channel surface used here."""
+
+    def __init__(self, socket: web.WebSocketResponse) -> None:
+        self._socket = socket
+
+    @property
+    def readyState(self) -> str:
+        """Return the browser data-channel spelling expected by shared helpers."""
+        return "closed" if self._socket.closed else "open"
+
+    def send(self, payload: str) -> None:
+        """Queue one text response on the server event loop."""
+        if self._socket.closed:
+            return
+        asyncio.create_task(self._socket.send_str(payload))
+
+
 class WebRTCServer:
     """Own the HTTP, signaling, input buffering, and media transport."""
 
@@ -348,12 +380,14 @@ class WebRTCServer:
         host: str = "127.0.0.1",
         port: int = 0,
         startup_timeout_seconds: float = 10.0,
+        transport: Literal["webrtc", "websocket"] = "webrtc",
     ) -> None:
         """
         Args:
             host: Interface on which the HTTP server listens.
             port: Listening port. Zero asks the operating system to choose one.
             startup_timeout_seconds: Maximum time to wait for server startup.
+            transport: Browser media transport served by this instance.
 
         Raises:
             RuntimeError: The server cannot start.
@@ -365,10 +399,13 @@ class WebRTCServer:
             raise ValueError("port must be between 0 and 65535.")
         if startup_timeout_seconds <= 0:
             raise ValueError("startup_timeout_seconds must be > 0.")
+        if transport not in {"webrtc", "websocket"}:
+            raise ValueError("transport must be 'webrtc' or 'websocket'.")
 
         self._host = host
         self._port = port
         self._startup_timeout_seconds = startup_timeout_seconds
+        self._transport = transport
         self._input_callback: Callable[[UserInputEvent], None] | None = None
         self._started = threading.Event()
         self._startup_error: BaseException | None = None
@@ -376,6 +413,8 @@ class WebRTCServer:
         self._runner: web.AppRunner | None = None
         self._offer_lock: asyncio.Lock | None = None
         self._peer_connection: RTCPeerConnection | None = None
+        self._websocket: web.WebSocketResponse | None = None
+        self._websocket_sender_task: asyncio.Task[None] | None = None
         self._control_channel: Any | None = None
         self._sent_cursor_options: tuple[bool, bool] | None = None
         self._link_lock = threading.Lock()
@@ -936,7 +975,10 @@ class WebRTCServer:
         app.router.add_get("/", self._serve_browser)
         app.router.add_get("/app.js", self._serve_browser_script)
         app.router.add_get("/healthz", self._health)
-        app.router.add_post("/api/webrtc/offer", self._offer)
+        if self._transport == "webrtc":
+            app.router.add_post("/api/webrtc/offer", self._offer)
+        else:
+            app.router.add_get("/api/websocket", self._accept_websocket)
         app.router.add_post("/api/files", self._upload_selected_file)
         runner = web.AppRunner(app)
         await runner.setup()
@@ -958,7 +1000,8 @@ class WebRTCServer:
 
     async def _serve_browser(self, _: web.Request) -> web.Response:
         """Return the minimal browser client."""
-        return web.Response(text=_BROWSER_PAGE, content_type="text/html")
+        page = _BROWSER_PAGE if self._transport == "webrtc" else _WEBSOCKET_BROWSER_PAGE
+        return web.Response(text=page, content_type="text/html")
 
     async def _serve_browser_script(self, _: web.Request) -> web.Response:
         """Return the browser client's JavaScript."""
@@ -966,14 +1009,143 @@ class WebRTCServer:
 
     async def _health(self, _: web.Request) -> web.Response:
         """Report whether the server has an open session and client."""
-        return web.json_response(
-            {
-                "open": self._session_desc is not None,
-                "client_connected": self._client_connected,
-                "hide_cursor": self._hide_cursor,
-                "lock_cursor_to_window": self._lock_cursor_to_window,
-            }
+        health: dict[str, bool | str] = {
+            "open": self._session_desc is not None,
+            "client_connected": self._client_connected,
+            "hide_cursor": self._hide_cursor,
+            "lock_cursor_to_window": self._lock_cursor_to_window,
+        }
+        if self._transport == "websocket":
+            health["transport"] = self._transport
+        return web.json_response(health)
+
+    async def _accept_websocket(self, request: web.Request) -> web.WebSocketResponse:
+        """Attach one TCP-only browser transport for video and controls."""
+        if self._closed:
+            raise web.HTTPServiceUnavailable(reason="Browser server is closed.")
+        session_desc = self._session_desc
+        if session_desc is None:
+            raise web.HTTPConflict(reason="Browser server is not open.")
+
+        socket_response = web.WebSocketResponse(
+            autoping=True,
+            heartbeat=20.0,
+            max_msg_size=1024 * 1024,
         )
+        await socket_response.prepare(request)
+
+        existing_socket = self._websocket
+        if existing_socket is not None:
+            await self._release_websocket(existing_socket)
+
+        video_track = _VideoTrack(session_desc.frames_per_second_for_ui)
+        self._websocket = socket_response
+        self._video_track = video_track
+        self._control_channel = _WebSocketControlChannel(socket_response)
+        self._sent_cursor_options = None
+        self._client_connected = True
+        self._media_connected.set()
+        self._cancel_link_press()
+        self._send_cursor_options()
+        self._append_query_string(request)
+        sender_task = asyncio.create_task(
+            self._send_websocket_frames(socket_response, video_track),
+            name="flashdreams-websocket-video",
+        )
+        self._websocket_sender_task = sender_task
+
+        try:
+            async for message in socket_response:
+                if message.type is web.WSMsgType.TEXT:
+                    try:
+                        self._buffer_browser_message(message.data)
+                    except ValueError as error:
+                        await socket_response.send_json(
+                            {"type": "error", "message": str(error)}
+                        )
+                elif message.type is web.WSMsgType.ERROR:
+                    error = socket_response.exception()
+                    if error is not None:
+                        raise error
+        finally:
+            await self._release_websocket(socket_response)
+        return socket_response
+
+    async def _send_websocket_frames(
+        self,
+        socket_response: web.WebSocketResponse,
+        video_track: _VideoTrack,
+    ) -> None:
+        """Encode the latest admitted frames as JPEG messages."""
+        codec: CodecContext | None = None
+        encoded_size: tuple[int, int] | None = None
+        try:
+            while not socket_response.closed:
+                frame = await video_track.recv()
+                frame_size = (frame.width, frame.height)
+                if frame_size != encoded_size:
+                    codec = _jpeg_encoder(*frame_size)
+                    encoded_size = frame_size
+                assert codec is not None
+                payload = b"".join(bytes(packet) for packet in codec.encode(frame))
+                if payload:
+                    await socket_response.send_bytes(payload)
+        except MediaStreamError:
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("WebSocket video sender failed")
+            if not socket_response.closed:
+                await socket_response.close(
+                    code=web.WSCloseCode.INTERNAL_ERROR,
+                    message=b"Video sender failed",
+                )
+
+    async def _release_websocket(self, socket_response: web.WebSocketResponse) -> None:
+        """Release one disconnected WebSocket while leaving the server open."""
+        if self._websocket is not socket_response:
+            if not socket_response.closed:
+                await socket_response.close()
+            return
+
+        self._websocket = None
+        self._media_connected.clear()
+        self._client_connected = False
+        track = self._video_track
+        self._video_track = None
+        self._control_channel = None
+        self._sent_cursor_options = None
+        self._cancel_link_press()
+        self._complete_abandoned_file_selectors()
+        if track is not None:
+            await track.close()
+            self._final_video_track_metrics = track.metrics_snapshot()
+
+        sender_task = self._websocket_sender_task
+        self._websocket_sender_task = None
+        if sender_task is not None and sender_task is not asyncio.current_task():
+            sender_task.cancel()
+            try:
+                await sender_task
+            except asyncio.CancelledError:
+                pass
+        if not socket_response.closed:
+            await socket_response.close()
+
+    def _append_query_string(self, request: web.Request) -> None:
+        """Buffer the viewer query string as one application input event."""
+        query_string = request.rel_url.raw_query_string
+        if not query_string:
+            return
+        timestamp_us = self._timestamp_us()
+        if timestamp_us is not None:
+            self._append_event(
+                QueryStringUserInputEvent(
+                    timestamp=timestamp_us,
+                    query_string=query_string,
+                )
+            )
 
     async def _upload_selected_file(self, request: web.Request) -> web.Response:
         """Receive one chosen file; the last one answers the pick.
@@ -1208,16 +1380,7 @@ class WebRTCServer:
             self._cancel_link_press()
             if control_channel is not None and control_channel.readyState == "open":
                 self._send_cursor_options()
-            query_string = request.rel_url.raw_query_string
-            if query_string:
-                timestamp_us = self._timestamp_us()
-                if timestamp_us is not None:
-                    self._append_event(
-                        QueryStringUserInputEvent(
-                            timestamp=timestamp_us,
-                            query_string=query_string,
-                        )
-                    )
+            self._append_query_string(request)
             return web.json_response(
                 {"sdp": local_description.sdp, "type": local_description.type}
             )
@@ -1526,6 +1689,12 @@ class WebRTCServer:
                 await self._release_peer_connection(peer_connection)
             except BaseException as error:
                 failures.append(error)
+        socket_response = self._websocket
+        if socket_response is not None:
+            try:
+                await self._release_websocket(socket_response)
+            except BaseException as error:
+                failures.append(error)
         self._media_connected.clear()
         self._client_connected = False
         track = self._video_track
@@ -1561,6 +1730,17 @@ def _query_int(request: web.Request, key: str) -> int | None:
         return int(request.query[key])
     except (KeyError, ValueError):
         return None
+
+
+def _jpeg_encoder(width: int, height: int) -> CodecContext:
+    """Create a low-latency one-packet-per-frame JPEG encoder."""
+    codec = CodecContext.create("mjpeg", "w")
+    codec.width = width
+    codec.height = height
+    codec.pix_fmt = "yuvj420p"
+    codec.options = {"qscale": "5"}
+    codec.open()
+    return codec
 
 
 def _same_stream_format(first: SessionDesc, second: SessionDesc) -> bool:

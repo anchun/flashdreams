@@ -299,3 +299,17 @@ class TestWebRTC:
             assert mode.starting(window) == f"Open {window.server.url} in a browser."
         finally:
             window.close()
+
+    def test_a_tcp_only_browser_run_is_told_where_to_connect(self) -> None:
+        from flashdreams.runtime_v2.websocket_client_window import (
+            WebSocketClientWindow,
+        )
+
+        mode = client_window_mode("websocket")
+        window = mode.create(_parsed(["--mode", "websocket"]))
+        try:
+            assert isinstance(window, WebSocketClientWindow)
+            assert window.server._transport == "websocket"
+            assert mode.starting(window) == f"Open {window.server.url} in a browser."
+        finally:
+            window.close()

@@ -27,8 +27,25 @@ Its public model variants are `OmnidreamsPipelineConfig` literals in
 ## Install
 
 ```bash
-uv sync --package flashdreams-omnidreams --inexact
+uv sync --frozen --inexact --python 3.12 \
+  --package flashdreams-omnidreams \
+  --package flashdreams --group cuda12
 ```
+
+The command above selects the Linux CUDA 12.8 PyTorch wheels. Before launching,
+point native CUDA extensions at the installed toolkit:
+
+```bash
+export CUDA_HOME="/usr/local/cuda-12.8"
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$CUDA_HOME/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+nvcc --version
+uv run --no-sync python -c \
+  'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name())'
+```
+
+Use `--group cuda13` and point `CUDA_HOME` at a CUDA 13 toolkit when using the
+CUDA 13 profile instead.
 
 Checkpoints and example scenes download from Hugging Face on first use. Export
 `HF_TOKEN` when the selected repository requires authentication.
@@ -47,10 +64,24 @@ sources. The default value is `0` (only downloads missing sources).
 Launch Interactive Drive in a browser with:
 
 ```bash
-uv sync --package flashdreams-omnidreams --extra interactive-drive --inexact
+uv sync --frozen --inexact --python 3.12 \
+  --package flashdreams-omnidreams --extra interactive-drive \
+  --package flashdreams --group cuda12
 uv run --no-sync flashdreams-run-v2 interactive-drive-omnidreams \
   --mode webrtc --host 0.0.0.0 --port 8089
 ```
+
+If the public deployment exposes only TCP and cannot provide a direct WebRTC
+media path, VPN, or TURN relay, use the TCP-only browser transport instead:
+
+```bash
+uv run --no-sync flashdreams-run-v2 interactive-drive-omnidreams \
+  --mode websocket --host 0.0.0.0 --port 8089
+```
+
+WebSocket mode carries JPEG frames and controls through that single port. It
+supports one browser at a time and may use more bandwidth or latency than
+WebRTC.
 
 ## Programmatic pipeline access
 

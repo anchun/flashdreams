@@ -1,12 +1,19 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-const peer = new RTCPeerConnection();
-const controls = peer.createDataChannel("controls");
-const pointerControls = peer.createDataChannel("pointer-controls");
-peer.addTransceiver("video", {direction: "recvonly"});
+const transportKind = document.currentScript?.dataset.transport ?? "webrtc";
 const video = document.getElementById("video");
 const status = document.getElementById("status");
+let peer = null;
+let controls = null;
+let pointerControls = null;
+let socket = null;
+if (transportKind === "webrtc") {
+  peer = new RTCPeerConnection();
+  controls = peer.createDataChannel("controls");
+  pointerControls = peer.createDataChannel("pointer-controls");
+  peer.addTransceiver("video", {direction: "recvonly"});
+}
 const promptDialog = document.getElementById("prompt-dialog");
 const promptBackdrop = document.getElementById("prompt-backdrop");
 const promptDialogTitle = document.getElementById("prompt-dialog-title");
@@ -42,14 +49,17 @@ const showStatus = (message, isError = false) => {
 };
 
 const send = (payload, channel = controls) => {
-  if (channel.readyState !== "open") {
+  const isOpen = channel instanceof WebSocket
+    ? channel.readyState === WebSocket.OPEN
+    : channel?.readyState === "open";
+  if (!isOpen) {
     return false;
   }
   try {
     channel.send(JSON.stringify(payload));
     return true;
   } catch (error) {
-    console.debug("Unable to send WebRTC control message.", error);
+    console.debug("Unable to send browser control message.", error);
     return false;
   }
 };
@@ -398,7 +408,7 @@ const openFileSelector = options => {
 window.addEventListener("focus", updateCursorVisibility);
 window.addEventListener("blur", updateCursorVisibility);
 
-controls.addEventListener("message", event => {
+const handleControlMessage = event => {
   if (typeof event.data !== "string") {
     return;
   }
@@ -421,35 +431,39 @@ controls.addEventListener("message", event => {
       return;
     }
     if (payload?.type === "error") {
-      console.warn(`WebRTC server: ${payload.message ?? "unknown error"}`);
+      console.warn(`Browser server: ${payload.message ?? "unknown error"}`);
     }
   } catch (error) {
-    console.warn("Ignored malformed WebRTC control response.", error);
+    console.warn("Ignored malformed browser control response.", error);
   }
-});
-
-peer.ontrack = event => {
-  video.srcObject = event.streams[0] ?? new MediaStream([event.track]);
-  video.play().catch(error => {
-    showStatus(`Video playback failed: ${error.message}`, true);
-  });
 };
 
-video.addEventListener("playing", () => {
-  status.hidden = true;
-});
+controls?.addEventListener("message", handleControlMessage);
 
-peer.addEventListener("connectionstatechange", () => {
-  if (peer.connectionState === "connected") {
-    if (video.readyState < 2) {
-      showStatus("Connected. Waiting for the first video frame…");
-    } else {
-      status.hidden = true;
+if (peer !== null) {
+  peer.ontrack = event => {
+    video.srcObject = event.streams[0] ?? new MediaStream([event.track]);
+    video.play().catch(error => {
+      showStatus(`Video playback failed: ${error.message}`, true);
+    });
+  };
+
+  video.addEventListener("playing", () => {
+    status.hidden = true;
+  });
+
+  peer.addEventListener("connectionstatechange", () => {
+    if (peer.connectionState === "connected") {
+      if (video.readyState < 2) {
+        showStatus("Connected. Waiting for the first video frame…");
+      } else {
+        status.hidden = true;
+      }
+    } else if (["failed", "closed"].includes(peer.connectionState)) {
+      showStatus(`WebRTC connection ${peer.connectionState}.`, true);
     }
-  } else if (["failed", "closed"].includes(peer.connectionState)) {
-    showStatus(`WebRTC connection ${peer.connectionState}.`, true);
-  }
-});
+  });
+}
 
 window.addEventListener("keydown", event => {
   const keyId = event.code || event.key;
@@ -486,16 +500,18 @@ video.tabIndex = 0;
 
 const renderedVideoBounds = () => {
   const bounds = video.getBoundingClientRect();
-  if (!video.videoWidth || !video.videoHeight || !bounds.width || !bounds.height) {
+  const sourceWidth = video.videoWidth || video.naturalWidth;
+  const sourceHeight = video.videoHeight || video.naturalHeight;
+  if (!sourceWidth || !sourceHeight || !bounds.width || !bounds.height) {
     return bounds;
   }
 
   const scale = Math.min(
-    bounds.width / video.videoWidth,
-    bounds.height / video.videoHeight,
+    bounds.width / sourceWidth,
+    bounds.height / sourceHeight,
   );
-  const width = video.videoWidth * scale;
-  const height = video.videoHeight * scale;
+  const width = sourceWidth * scale;
+  const height = sourceHeight * scale;
   return {
     left: bounds.left + (bounds.width - width) / 2,
     top: bounds.top + (bounds.height - height) / 2,
@@ -837,7 +853,7 @@ const waitForServer = async () => {
         return state;
       }
     } catch (error) {
-      console.debug("WebRTC server is not ready yet.", error);
+      console.debug("Browser server is not ready yet.", error);
     }
     await new Promise(resolve => setTimeout(resolve, 100));
   }
@@ -865,7 +881,64 @@ async function connect() {
   await peer.setRemoteDescription(await response.json());
 }
 
-connect().catch(error => {
-  console.error("Unable to start WebRTC.", error);
-  showStatus(`Unable to start WebRTC: ${error.message}`, true);
+async function connectWebSocket() {
+  showStatus("Waiting for the server…");
+  const server = await waitForServer();
+  applyCursorOptions(server);
+  const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
+  socket = new WebSocket(
+    `${scheme}//${window.location.host}/api/websocket${window.location.search}`,
+  );
+  socket.binaryType = "blob";
+  controls = socket;
+  pointerControls = socket;
+  socket.addEventListener("message", handleControlMessage);
+  let currentFrameUrl = null;
+  socket.addEventListener("message", event => {
+    if (!(event.data instanceof Blob)) {
+      return;
+    }
+    const nextFrameUrl = URL.createObjectURL(event.data);
+    const previousFrameUrl = currentFrameUrl;
+    currentFrameUrl = nextFrameUrl;
+    video.addEventListener("load", () => {
+      status.hidden = true;
+      if (previousFrameUrl !== null) {
+        URL.revokeObjectURL(previousFrameUrl);
+      }
+    }, {once: true});
+    video.src = nextFrameUrl;
+  });
+  await new Promise((resolve, reject) => {
+    socket.addEventListener("open", resolve, {once: true});
+    socket.addEventListener("error", () => {
+      reject(new Error("WebSocket connection failed."));
+    }, {once: true});
+  });
+  showStatus("Connected. Waiting for the first video frame…");
+  socket.addEventListener("close", event => {
+    controls = null;
+    pointerControls = null;
+    if (currentFrameUrl !== null) {
+      URL.revokeObjectURL(currentFrameUrl);
+      currentFrameUrl = null;
+    }
+    showStatus(
+      event.wasClean
+        ? "WebSocket connection closed."
+        : "WebSocket connection failed.",
+      !event.wasClean,
+    );
+  });
+}
+
+const connectTransport = transportKind === "websocket" ? connectWebSocket : connect;
+connectTransport().catch(error => {
+  if (transportKind === "websocket") {
+    console.error("Unable to start WebSocket.", error);
+    showStatus(`Unable to start WebSocket: ${error.message}`, true);
+  } else {
+    console.error("Unable to start WebRTC.", error);
+    showStatus(`Unable to start WebRTC: ${error.message}`, true);
+  }
 });

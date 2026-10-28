@@ -26,9 +26,10 @@ or several cameras, scene switching, and optional generated LiDAR.
 
 ### Interactive Drive
 
-Use Linux, Python 3.12, an NVIDIA GPU with **80 GB+ VRAM**, an R580+ driver,
-**100 GB+ free storage**, a CUDA 13 toolkit (`nvcc`), and a C++ compiler.
-The UI also needs Vulkan with CUDA interop on the server GPU.
+Use Linux, Python 3.12, an NVIDIA GPU with **80 GB+ VRAM**, **100 GB+ free
+storage**, either an R570.26+ driver with CUDA 12.8 or an R580+ driver with
+CUDA 13, the matching CUDA toolkit (`nvcc`), and a C++ compiler. The UI also
+needs Vulkan with CUDA interop on the server GPU.
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and
 [clone FlashDreams](../quickstart/index.md#install), then run from its root.
 The checkout must contain `integrations_v2/cosmos3_nano_sim_auto`.
@@ -40,10 +41,20 @@ Your Hugging Face account needs access to the checkpoint above and
 export HF_TOKEN="<your-hugging-face-token>"
 uv sync --frozen --inexact --python 3.12 \
   --package flashdreams-cosmos3-nano-sim-auto --extra interactive-drive \
-  --package flashdreams --group cuda13
+  --package flashdreams --group cuda12
+export CUDA_HOME="/usr/local/cuda-12.8"
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$CUDA_HOME/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+nvcc --version
+uv run --no-sync python -c \
+  'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name())'
 uv run --no-sync flashdreams-run-v2 interactive-drive-cosmos3-nano-sim-auto \
   --mode webrtc --host 0.0.0.0 --port 8080
 ```
+
+The command above selects the Linux CUDA 12.8 PyTorch wheels. Adjust
+`CUDA_HOME` if the toolkit is installed elsewhere, or use `--group cuda13` and
+point `CUDA_HOME` at CUDA 13 when running with that profile.
 
 Open `http://<server-address>:8080/` (`localhost` for a local browser).
 

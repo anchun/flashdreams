@@ -29,9 +29,10 @@ Playback follows simulation time.
 
 ## Install
 
-Use Linux, an NVIDIA GPU with **80 GB+ VRAM**, an **R580+ driver** and
-**100 GB+ free storage**; see the [system requirements](../../README.md#system-requirements).
-The map renderer also needs a CUDA 13 toolkit (`nvcc`) and a C++ compiler.
+Use Linux, an NVIDIA GPU with **80 GB+ VRAM**, **100 GB+ free storage**, and
+either an **R570.26+ driver with CUDA 12.8** or an **R580+ driver with CUDA 13**;
+see the [system requirements](../../README.md#system-requirements). The map
+renderer also needs the matching CUDA toolkit (`nvcc`) and a C++ compiler.
 
 The sidebar and sensor layout require **Vulkan graphics with CUDA interop on the
 server GPU**, including in WebRTC browser mode. CUDA support alone is not enough
@@ -51,21 +52,28 @@ cd flashdreams
 export HF_TOKEN="<your-hugging-face-token>"
 uv sync --frozen --inexact --python 3.12 \
   --package flashdreams-cosmos3-nano-sim-auto --extra interactive-drive \
-  --package flashdreams --group cuda13
+  --package flashdreams --group cuda12
 ```
 
 Skip cloning for an existing checkout. You can use
 `uv run --no-sync hf auth login` instead of setting `HF_TOKEN`.
-If your CUDA 13 toolkit is not already configured, set its location and check it:
+The command above selects the Linux CUDA 12.8 PyTorch wheels. Use
+`--group cuda13` instead when running with CUDA 13.
+
+Set the selected toolkit's location and check both the compiler and PyTorch
+runtime before launching:
 
 ```bash
-export CUDA_HOME="<your-CUDA-13-toolkit-directory>"
+export CUDA_HOME="/usr/local/cuda-12.8"
 export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$CUDA_HOME/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 nvcc --version
+uv run --no-sync python -c \
+  'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name())'
 ```
 
-For a toolkit installed in this Python environment, its root is
+Adjust `CUDA_HOME` if the toolkit is installed elsewhere. For CUDA 13 installed
+inside this Python environment, its root is
 `$(pwd)/.venv/lib/python3.12/site-packages/nvidia/cu13`.
 
 The first launch downloads the

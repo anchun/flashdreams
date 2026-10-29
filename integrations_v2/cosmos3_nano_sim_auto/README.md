@@ -119,17 +119,17 @@ Start with one front-wide view:
 uv run --no-sync flashdreams-run-v2 interactive-drive-cosmos3-nano-sim-auto \
   --mode webrtc --host 0.0.0.0 --port 8080
 
-# run with two GPUs and set chunk-frames 1
+# run with two GPUs and set chunk-frames 1 and denoise steps
 export CUDA_VISIBLE_DEVICES=0,1
 uv run --no-sync torchrun --standalone --nproc_per_node=2 --no-python \
  flashdreams-run-v2 interactive-drive-cosmos3-nano-sim-auto  \
- --mode websocket --host 0.0.0.0 --port 60089 --   --views 1 --chunk-frames 1
+ --mode websocket --host 0.0.0.0 --port 60089 --   --views 1 --chunk-frames 1 --denoise-steps 3
 
 # compile-denoise for extra performance
 COSMOS3_NANO_SIM_AUTO_TENSOR_PARALLEL=1 uv run --no-sync torchrun --standalone \
  --nproc_per_node=2 --no-python   flashdreams-run-v2 interactive-drive-cosmos3-nano-sim-auto \
  --mode websocket --host 0.0.0.0 --port 60089 --   --views 1 --parallel-decode \
- --chunk-frames 1 --compile-denoise default --no-ui
+ --chunk-frames 1 --compile-denoise default --denoise-steps 2 --no-ui
 
 ```
 
@@ -137,6 +137,12 @@ Open `http://<server-address>:8080/`; use `localhost` when running locally.
 The residential, rain and snow bundles download automatically. First startup
 may compile the map renderer; denoiser compilation is off by default.
 A successful run advances from the opening image to generated frames.
+
+`--chunk-frames 1` and `--denoise-steps 1|2|3` are experimental
+latency/quality tradeoffs. The checkpoint's quality configuration is three
+latent frames per chunk with four denoising steps. Fewer denoising steps use a
+coarser final jump to clean and can reduce detail and long-rollout stability;
+`--denoise-steps 0` restores the checkpoint's full four-step schedule.
 
 Defaults select one front-wide RGB camera, the residential scene, opening frame
 zero and model seed zero. Presentation is continuous with blocking backpressure.

@@ -239,6 +239,17 @@ def test_experimental_chunk_frames_reaches_the_interactive_backend(tmp_path):
     assert app._backend._settings.frames_per_chunk == 1
 
 
+@pytest.mark.parametrize("value,expected", [("2", 2), ("0", None)])
+def test_experimental_denoise_steps_reaches_the_interactive_backend(
+    tmp_path, value, expected
+):
+    app = create_app()
+    app.init(["--scene", str(tmp_path), "--denoise-steps", value])
+
+    assert isinstance(app._backend, MultiViewRenderBackend)
+    assert app._backend._settings.denoise_steps == expected
+
+
 @pytest.mark.parametrize(
     "args,message",
     [
@@ -248,6 +259,7 @@ def test_experimental_chunk_frames_reaches_the_interactive_backend(tmp_path):
         (["--views", "7", "--camera", CAMERAS[0]], "not allowed"),
         ([f"--camera={CAMERAS[0]}", "--views=1"], "not allowed"),
         (["--chunk-frames", "0"], "--chunk-frames must be positive"),
+        (["--denoise-steps", "-1"], "--denoise-steps must be non-negative"),
     ],
 )
 def test_invalid_camera_presets_fail_before_preparing_assets(

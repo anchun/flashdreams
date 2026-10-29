@@ -230,6 +230,14 @@ class CosmosInteractiveDriveApplication(InteractiveDriveApplication):
             "per chunk with unqualified quality.",
         )
         parser.add_argument(
+            "--denoise-steps",
+            type=int,
+            default=self._settings.denoise_steps,
+            help="Experimental distilled SDE steps per chunk. The checkpoint's "
+            "quality setting is 4; fewer steps trade quality for latency. "
+            "0 uses the checkpoint's full schedule.",
+        )
+        parser.add_argument(
             "--compile-control-encode",
             action="store_true",
             help="Run the map's control encoder under torch.compile",
@@ -263,6 +271,8 @@ class CosmosInteractiveDriveApplication(InteractiveDriveApplication):
             self._default_fps = args.fps
         if args.chunk_frames < 1:
             parser.error("--chunk-frames must be positive")
+        if args.denoise_steps is not None and args.denoise_steps < 0:
+            parser.error("--denoise-steps must be non-negative")
         if args.no_ui:
             shared.append("--no-ui")
         if "--help" in shared or "-h" in shared:
@@ -290,6 +300,9 @@ class CosmosInteractiveDriveApplication(InteractiveDriveApplication):
             if args.compile_denoise == "off"
             else args.compile_denoise,
             frames_per_chunk=args.chunk_frames,
+            denoise_steps=(
+                None if args.denoise_steps == 0 else args.denoise_steps
+            ),
             parallel_decode=args.parallel_decode or self._settings.parallel_decode,
             decoder_compile=args.decoder_compile or self._settings.decoder_compile,
             compile_control_encode=args.compile_control_encode

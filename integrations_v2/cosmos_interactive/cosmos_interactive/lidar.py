@@ -33,6 +33,9 @@ from cosmos_interactive._lidar_codec.range_image import (
     metric_lidar_to_network,
     network_lidar_to_metric_clip,
 )
+from cosmos_interactive._lidar_codec.transformer_vae import (
+    CircularNeighborhoodSelfAttentionBlock,
+)
 from cosmos_interactive._patchify import patchify_latent, unpatchify_latent
 
 
@@ -91,8 +94,11 @@ class LidarTokenizer:
         device: str = "cuda",
         version: Literal["v1p1", "v1p2"] = "v1p1",
         contiguous_linears: bool = False,
+        attention_block_size: int = 32,
     ) -> LidarTokenizer:
         """Load the explicit tokenizer architecture, independent of checkpoint filename."""
+        if type(attention_block_size) is not int or attention_block_size not in (32, 64):
+            raise ValueError("LiDAR attention_block_size must be 32 or 64")
         config = network_config(version)
         spatial = 2 ** len(config["depths"])
         geometry = LidarGeometry(
@@ -100,6 +106,9 @@ class LidarTokenizer:
             width=config["resolution"][1] // spatial,
         )
         backend = LidarCodec(checkpoint, version=version, device=device)
+        for module in backend.model.modules():
+            if isinstance(module, CircularNeighborhoodSelfAttentionBlock):
+                module.attention_block_size = attention_block_size
         if contiguous_linears:
             # Flatten FP32 projections into one GEMM instead of broadcasted BMMs.
             for module in backend.model.modules():

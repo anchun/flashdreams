@@ -19,8 +19,16 @@ pytestmark = pytest.mark.ci_cpu
 )
 @pytest.mark.parametrize("patch_dim", [128, 512])
 @pytest.mark.parametrize("contiguous_linears", [False, True])
+@pytest.mark.parametrize("attention_block_size", [32, 64])
 def test_codec_version_preserves_semantic_rays_across_streaming_boundary(
-    monkeypatch, version, levels, width, tokens, patch_dim, contiguous_linears
+    monkeypatch,
+    version,
+    levels,
+    width,
+    tokens,
+    patch_dim,
+    contiguous_linears,
+    attention_block_size,
 ):
     observed = {}
 
@@ -29,7 +37,10 @@ def test_codec_version_preserves_semantic_rays_across_streaming_boundary(
         projection = torch.nn.Linear(4, 4, bias=False)
         torch.nn.init.eye_(projection.weight)
         return SimpleNamespace(
-            model=torch.nn.Sequential(projection),
+            model=torch.nn.Sequential(
+                projection,
+                lidar.CircularNeighborhoodSelfAttentionBlock(16, 2, [3, 3]),
+            ),
             range_projection=RangeProjection(model_width=observed["resolution"][1]),
             device=device,
             dtype=torch.float32,
@@ -38,11 +49,16 @@ def test_codec_version_preserves_semantic_rays_across_streaming_boundary(
     monkeypatch.setattr(lidar, "LidarCodec", backend)
     # A misleading filename must never select the latent basis.
     tokenizer = lidar.LidarTokenizer.from_checkpoint(
-        "v1p1.pt", device="cpu", version=version, contiguous_linears=contiguous_linears
+        "v1p1.pt",
+        device="cpu",
+        version=version,
+        contiguous_linears=contiguous_linears,
+        attention_block_size=attention_block_size,
     )
     prepared = tokenizer
     tokenizer = prepared.with_patch_dim(patch_dim)
     linear = tokenizer.backend.model[0]
+    assert tokenizer.backend.model[1].attention_block_size == attention_block_size
     assert len(linear._forward_pre_hooks) == int(contiguous_linears)
     linear.register_forward_pre_hook(
         lambda _module, inputs: observed.update(contiguous=inputs[0].is_contiguous())

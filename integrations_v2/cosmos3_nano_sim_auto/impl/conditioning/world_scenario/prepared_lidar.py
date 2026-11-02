@@ -211,6 +211,7 @@ class Renderer:
         optimized: bool = False,
         cull: bool = False,
         settle: bool = False,
+        sweep_rgb_frames: int = 3,
     ) -> None:
         self.data = scene.lidar
         if self.data is None:
@@ -218,6 +219,9 @@ class Renderer:
                 "LiDAR requires a v2 prepared scene; use the LiDAR scene ZIP"
             )
         require_implementation()
+        if sweep_rgb_frames not in (3, 4):
+            raise ValueError("LiDAR sweeps must span three or four RGB frames")
+        self.sweep_rgb_frames = sweep_rgb_frames
         self.device = torch.device(device)
         self.optimized = optimized
         self.cull = cull
@@ -260,7 +264,9 @@ class Renderer:
 
     @torch.no_grad()
     def __call__(self, index: int, first: np.ndarray, last: np.ndarray) -> torch.Tensor:
-        frame = int(self.mapping[min(index * 3, len(self.mapping) - 1)])
+        frame = int(
+            self.mapping[min(index * self.sweep_rgb_frames, len(self.mapping) - 1)]
+        )
         budget = geometry.PointBudget(geometry.MAX_SCENE_POINTS - len(self.static))
         objects = torch.as_tensor(
             self.data.object_points(frame, density=self.density, budget=budget),
@@ -273,6 +279,7 @@ class Renderer:
             if fast
             else self.data.model
         )
+        model = replace(model, spinning_frequency_hz=30 / self.sweep_rgb_frames)
         stationary = np.array_equal(first, last)
         if (self.optimized and stationary) or self.cull:
             # Keep only points that can return within 100 m from *some* sensor

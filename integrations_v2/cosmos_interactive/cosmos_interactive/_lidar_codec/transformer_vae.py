@@ -199,6 +199,7 @@ class CircularNeighborhoodSelfAttentionBlock(GlobalSelfAttentionBlock):
         self.kernel_size = _pair(kernel_size)
         self.dilation = _pair(dilation)
         self.circular = circular
+        self.attention_block_size = 32
 
     def before_attn(self, q, k, v):
         if not self.circular:
@@ -234,6 +235,7 @@ class CircularNeighborhoodSelfAttentionBlock(GlobalSelfAttentionBlock):
             kernel_size=self.kernel_size,
             dilation=self.dilation,
             scale=1.0,
+            block_size=self.attention_block_size,
         )
         h = einops.rearrange(h, "B H W N D -> B H W (N D)")
         h = self.after_attn(h)

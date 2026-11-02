@@ -7,10 +7,10 @@ branch `cosmos3_gtc_berlin_release`, revision
 
 | Local file | Upstream file | Local changes |
 | --- | --- | --- |
-| `transformer_vae.py` | `transformer_vae.py` | Relative imports, CPU constructor shape arithmetic for meta-device inspection, inherited MIT attribution |
+| `transformer_vae.py` | `transformer_vae.py` | Relative imports, CPU constructor shape arithmetic for meta-device inspection, inherited MIT attribution, per-codec attention tile selection |
 | `rope.py` | `rope3d.py` | None |
 | `encoding.py` | `encoding.py` | None |
-| `neighborhood_attention.py` | `neighborhood_attention.py` | None |
+| `neighborhood_attention.py` | `neighborhood_attention.py` | 32-wide FP32 IEEE compute tiles by default; 64 remains available as a compatibility fallback |
 
 The upstream files retain vLLM-Omni contributor copyrights and Apache-2.0
 identifiers. The complete [upstream Apache license](https://github.com/MaciejBalaNV/vllm-omni/blob/8ef7df57219688835f3752accb2c3b2f444b4058/LICENSE)

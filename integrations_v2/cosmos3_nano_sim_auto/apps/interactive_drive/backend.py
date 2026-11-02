@@ -31,8 +31,9 @@ path the scene was already on, the app's first commands land on ground whose map
 is drawn, and steering reaches the picture a window later. That is the demo's
 behaviour, and undoing it means teaching the rollout to leave control slots
 unfilled rather than anything here. Joint RGB/LiDAR instead consumes only the
-current control chunk: an opening frame, then twelve camera frames with four
-completed LiDAR sweeps. Both renderers receive the same supplied vehicle path.
+current control chunk. Its automatic clock uses 7.5 Hz for one-latent chunks
+and 10 Hz for three-latent chunks; both advance four camera frames per RGB
+latent. Both renderers receive the same supplied vehicle path.
 """
 
 from __future__ import annotations
@@ -143,10 +144,14 @@ class MultiViewSettings:
 
     lidar_checkpoint: Path | None = None
     """Enable live joint generation with this trained LiDAR codec."""
+    lidar_fps: float | None = None
+    """Live scan clock; ``None`` selects 7.5 Hz for short chunks and 10 Hz otherwise."""
     lidar_tokenizer_version: Literal["v1p1", "v1p2"] = "v1p2"
     """Codec architecture matching ``lidar_checkpoint``."""
     lidar_contiguous_linears: bool = False
     """Use contiguous FP32 codec projections; benchmark for the target GPU."""
+    lidar_attention_block_size: int = 32
+    """FP32 codec attention tile; 64 restores the compatibility baseline."""
     lidar_view: LidarView = LidarView.POINT_CLOUD
     """Visualization of the generated and HD-map LiDAR sensor cells."""
     optimized_lidar_renderer: bool = False
@@ -207,15 +212,33 @@ class MultiViewRenderBackend(RenderBackend):
     ) -> None:
         super().__init__(chunk, raster)
         self._settings = settings or MultiViewSettings()
+        if self._settings.lidar_fps is None:
+            self._settings = replace(
+                self._settings,
+                lidar_fps=(
+                    7.5 if self._settings.frames_per_chunk == 1 else 10.0
+                ),
+            )
         if self._settings.lidar_checkpoint is not None and (
             chunk.fps != 30
-            or self._settings.frames_per_chunk != 3
+            or self._settings.lidar_fps not in (7.5, 10.0)
+            or self._settings.frames_per_chunk not in (1, 3)
             or self._settings.condition_frames != 1
             or self._settings.attention_scope != "decomposed"
         ):
             raise ValueError(
-                "Live LiDAR requires 30 FPS, three RGB latents per chunk, "
+                "Live LiDAR requires 30 FPS RGB, 7.5 or 10 LiDAR FPS, "
+                "one or three RGB latents per chunk, "
                 "one opening frame and decomposed attention"
+            )
+        if (
+            self._settings.lidar_checkpoint is not None
+            and self._settings.lidar_fps == 7.5
+        ):
+            logger.warning(
+                "Live LiDAR uses the 7.5 Hz short-chunk clock; trained-model quality "
+                "at this sensor rate is unqualified. Use --lidar-fps 10 to restore "
+                "the original clock."
             )
         mesh = self._settings.parallel
         # Refused here, before 28 GiB of weights load, rather than by the rollout.
@@ -388,6 +411,7 @@ class MultiViewRenderBackend(RenderBackend):
         recorded on the stream and read once at the end, so the stages are the
         GPU's own and the measurement does not serialise what it measures.
         """
+        started = time.perf_counter()
         rollout, poses, drawn = self._rollout, self._poses, self._drawn
         if rollout is None or poses is None or drawn is None:
             raise RuntimeError("load_scene() must run before a chunk is rendered.")
@@ -481,6 +505,7 @@ class MultiViewRenderBackend(RenderBackend):
             self._timings.update(self._lidar.last_metrics)
             self._timings.update(
                 lidar_enabled=1.0,
+                lidar_fps=self._settings.lidar_fps,
                 lidar_decode_s=stages["lidar_decode"] / 1000,
                 lidar_render_s=stages["lidar_render"] / 1000,
             )
@@ -511,6 +536,7 @@ class MultiViewRenderBackend(RenderBackend):
                 for index, frame in enumerate(presented)
             )
         self._frames_emitted += frames
+        self._timings["backend_wall_ms"] = (time.perf_counter() - started) * 1000
         return FrameChunk(
             frames=presented,
             boundary_state_after_chunk=trajectory.boundary_state_after_chunk,
@@ -555,8 +581,11 @@ class MultiViewRenderBackend(RenderBackend):
             f"total_ms={total_ms:.1f} "
             f"fps={frames / (total_ms / 1000.0):.2f}"
             + (
-                f" lidar_renderer={_renderer_label(self._settings)} "
+                f" lidar_sweeps={int(timings['lidar_sweeps'])} "
+                f"lidar_fps={self._settings.lidar_fps:g} "
+                f"lidar_renderer={_renderer_label(self._settings)} "
                 f"lidar_contiguous_linears={self._settings.lidar_contiguous_linears} "
+                f"lidar_attention_block_size={self._settings.lidar_attention_block_size} "
                 + " ".join(
                     f"{label}_ms={timings[key] * 1000:.1f}"
                     for label, key in (
@@ -744,7 +773,9 @@ class MultiViewRenderBackend(RenderBackend):
                 device=self._device,
                 version=settings.lidar_tokenizer_version,
                 contiguous_linears=settings.lidar_contiguous_linears,
+                attention_block_size=settings.lidar_attention_block_size,
                 fps=float(self._chunk.fps),
+                lidar_fps=settings.lidar_fps,
                 patch_dim=self._network.lidar2llm.in_features,
                 optimized=settings.optimized_lidar_renderer,
                 cull=settings.culled_lidar_renderer,

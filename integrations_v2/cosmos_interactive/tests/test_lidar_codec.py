@@ -30,6 +30,64 @@ from cosmos_interactive.lidar import (
 pytestmark = pytest.mark.ci_cpu
 
 
+@pytest.mark.parametrize("block_size", [32, 64])
+@pytest.mark.parametrize("dilation", [1, 2])
+def test_attention_tiles_preserve_inward_shifted_neighborhood(block_size, dilation):
+    from cosmos_interactive._lidar_codec.neighborhood_attention import (
+        _mask_predicate,
+        neighborhood_attention_2d,
+    )
+
+    generator = torch.Generator().manual_seed(7)
+    q, k, v = [torch.randn(1, 9, 11, 2, 8, generator=generator) for _ in range(3)]
+    index = torch.arange(99)
+    mask = _mask_predicate(9, 11, (3, 3), (dilation, dilation))(
+        0, 0, index[:, None], index[None]
+    )
+    tensors = [t.permute(0, 3, 1, 2, 4).reshape(1, 2, 99, 8) for t in (q, k, v)]
+    expected = (
+        torch.nn.functional.scaled_dot_product_attention(
+            *tensors, attn_mask=mask, scale=1.0
+        )
+        .transpose(1, 2)
+        .reshape_as(q)
+    )
+    actual = neighborhood_attention_2d(
+        q,
+        k,
+        v,
+        kernel_size=(3, 3),
+        dilation=dilation,
+        scale=1.0,
+        block_size=block_size,
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+def test_attention_tile_preserves_ieee_and_shared_options(monkeypatch):
+    from cosmos_interactive._lidar_codec import neighborhood_attention as attention
+
+    observed = {}
+
+    def run(q, k, v, **kwargs):
+        observed.update(kwargs["kernel_options"])
+        return q
+
+    monkeypatch.setattr(attention, "flex_attention", run)
+    original = attention._KERNEL_OPTIONS.copy()
+    x = torch.zeros(1, 1, 1, 16)
+    attention._run_attention(x, x, x, None, 1.0, 32)
+    assert observed["BLOCK_M"] == observed["BLOCK_N"] == 32
+    assert observed["FLOAT32_PRECISION"] == "'ieee'"
+    assert attention._KERNEL_OPTIONS == original
+
+
+@pytest.mark.parametrize("block_size", [0, 16, 128, 32.0, True])
+def test_attention_tile_rejected_before_loading_weights(block_size):
+    with pytest.raises(ValueError, match="attention_block_size"):
+        LidarTokenizer.from_checkpoint("missing", attention_block_size=block_size)
+
+
 @pytest.mark.parametrize(
     "version,expected",
     [
@@ -178,8 +236,9 @@ def test_checkpoint_rejects_incompatible_weights_and_statistics(tmp_path, fault,
         load_checkpoint(model, str(path))
 
 
+@pytest.mark.parametrize("counts", [(1, 4, 4, 4), (1, 1, 1, 2, 1, 1, 2, 1, 1, 2)])
 @torch.inference_mode()
-def test_streaming_is_causal_bounded_and_resettable():
+def test_streaming_is_causal_bounded_and_resettable(counts):
     torch.manual_seed(3)
     model = tiny_model().eval()
     # Trained projections are not zero. Exercise attention/FFN paths rather
@@ -204,12 +263,14 @@ def test_streaming_is_causal_bounded_and_resettable():
     raw[:, 2] = 1
     start = 0
     encoded = []
-    for count in (1, 4, 4, 4):
+    decoded_chunks = []
+    for count in counts:
         z = encoder(raw[:, :, start : start + count])
         decoded = decoder(z)
         assert decoded.shape == (1, 3, count, 4, 8)
         assert torch.isfinite(decoded).all()
         encoded.append(z)
+        decoded_chunks.append(decoded)
         start += count
         for stream in (encoder, decoder):
             assert {k.shape[2] for k, _ in stream.cache.values()} == {min(9, start)}
@@ -217,10 +278,17 @@ def test_streaming_is_causal_bounded_and_resettable():
     decoder.reset()
     assert encoder.cache is None and decoder.cache is None
     torch.testing.assert_close(encoder(raw[:, :, :1]), encoded[0], rtol=0, atol=0)
+    torch.testing.assert_close(decoder(encoded[0]), decoded_chunks[0], rtol=0, atol=0)
     # Before eviction, split chunks equal a causal prefix evaluated at once.
     prefix = LidarEncoder(tokenizer)(raw[:, :, :9])
     torch.testing.assert_close(
-        torch.cat(encoded[:3], dim=2), prefix, atol=2e-6, rtol=2e-5
+        torch.cat(encoded, dim=2)[:, :, :9], prefix, atol=2e-6, rtol=2e-5
+    )
+    torch.testing.assert_close(
+        torch.cat(decoded_chunks, dim=2)[:, :, :9],
+        LidarDecoder(tokenizer)(prefix),
+        atol=2e-5,
+        rtol=2e-5,
     )
     altered = raw[:, :, :9].clone()
     altered[:, :, 1:] = 0

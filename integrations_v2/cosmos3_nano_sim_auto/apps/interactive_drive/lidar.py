@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
+from dataclasses import replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
@@ -46,6 +47,7 @@ def _codec(
     device: str,
     version: Literal["v1p1", "v1p2"],
     contiguous_linears: bool,
+    attention_block_size: int = 32,
 ) -> LidarTokenizer:
     """Codec weights, loaded once per process and reused across restarts."""
     return LidarTokenizer.from_checkpoint(
@@ -53,6 +55,7 @@ def _codec(
         device=device,
         version=version,
         contiguous_linears=contiguous_linears,
+        attention_block_size=attention_block_size,
     )
 
 
@@ -85,12 +88,12 @@ class _LiveLidarClock(LidarStream):
             torch.arange(
                 first_sweep, first_sweep + count, device=device, dtype=torch.float64
             )
-            / 10.0
+            / self.assets.tokenizer.geometry.fps
         )
 
 
 class LiveLidarStream(_LiveLidarClock):
-    """Render completed 10 Hz sweeps from a bounded, supplied 30 Hz rig path.
+    """Render completed sweeps from a bounded, supplied 30 Hz rig path.
 
     Sweep zero is an instantaneous opening scan. Later sweeps cover the trailing
     interval ending at their timestamp, so rolling shutter never reads an ego
@@ -108,6 +111,9 @@ class LiveLidarStream(_LiveLidarClock):
         renderers: list[int] | None = None,
     ) -> None:
         super().__init__(assets)
+        if assets.tokenizer.geometry.fps not in (7.5, 10.0):
+            raise ValueError("Live LiDAR supports 7.5 or 10 Hz")
+        self._sweep_rgb_frames = round(30 / assets.tokenizer.geometry.fps)
         self._sensor_to_rig = np.asarray(sensor_to_rig, dtype=np.float32)
         self._render_sweep = render_sweep
         self._poses = np.empty((0, 4, 4), dtype=np.float32)
@@ -148,12 +154,12 @@ class LiveLidarStream(_LiveLidarClock):
     def _check(self, start: int, end: int) -> None:
         if start != self.next_sweep or not start < end:
             raise ValueError("Live LiDAR sweeps must be consumed once, consecutively")
-        if (end - 1) * 3 >= self._supplied:
+        if (end - 1) * self._sweep_rgb_frames >= self._supplied:
             raise ValueError("Supply the driven rig path before rendering LiDAR sweeps")
 
     def _sweep(self, index: int) -> Tensor:
-        first = max(0, (index - 1) * 3) - self._first_frame
-        last = index * 3 - self._first_frame
+        first = max(0, (index - 1) * self._sweep_rgb_frames) - self._first_frame
+        last = index * self._sweep_rgb_frames - self._first_frame
         return self._render_sweep(
             index,
             self._poses[first] @ self._sensor_to_rig,
@@ -258,7 +264,7 @@ class LiveLidarStream(_LiveLidarClock):
         self.last_control_range = (start, end)
         self.next_sweep = end
         # Retain the final endpoint: it starts the next completed scan.
-        last_frame = (end - 1) * 3
+        last_frame = (end - 1) * self._sweep_rgb_frames
         self._poses = self._poses[last_frame - self._first_frame :].copy()
         self._first_frame = last_frame
         return result
@@ -324,10 +330,12 @@ def make_live_lidar(
     device: torch.device | str,
     version: Literal["v1p1", "v1p2"] = "v1p2",
     fps: float = 30.0,
+    lidar_fps: float = 10.0,
     optimized: bool = False,
     cull: bool = False,
     tf32: bool = False,
     contiguous_linears: bool = False,
+    attention_block_size: int = 32,
     parallel: ParallelContext | None = None,
 ) -> LiveLidarStream:
     """Prepare the map renderer and trained codec for one live scene.
@@ -336,6 +344,10 @@ def make_live_lidar(
     """
     if fps != 30.0:
         raise ValueError("Interactive RGB + LiDAR currently requires 30 fps")
+    if lidar_fps not in (7.5, 10.0):
+        raise ValueError("Live LiDAR supports 7.5 or 10 Hz")
+    if type(attention_block_size) is not int or attention_block_size not in (32, 64):
+        raise ValueError("LiDAR attention_block_size must be 32 or 64")
     prepared = scene.metadata.get("prepared_scene")
     if prepared is not None:
         from cosmos3_nano_sim_auto.impl.conditioning.world_scenario.prepared_lidar import (
@@ -355,12 +367,18 @@ def make_live_lidar(
         # Each rank builds only what its role uses: renderers the map points on
         # the GPU, the owner (encode and decode) the codec weights.
         if renderers is None or rank in renderers:
-            key = (gpu, optimized, cull)
+            key = (gpu, optimized, cull, lidar_fps)
             if not _RENDERER or _RENDERER[0] is not prepared or _RENDERER[1] != key:
                 _RENDERER[:] = [
                     prepared,
                     key,
-                    Renderer(prepared, device=gpu, optimized=optimized, cull=cull),
+                    Renderer(
+                        prepared,
+                        device=gpu,
+                        optimized=optimized,
+                        cull=cull,
+                        sweep_rgb_frames=round(fps / lidar_fps),
+                    ),
                 ]
             render_sweep = _RENDERER[2]
         else:
@@ -370,10 +388,13 @@ def make_live_lidar(
             scene.initial_rig_to_world
         ) @ prepared.lidar.sensor_to_world(prepared, opening)
         tokenizer = (
-            _codec(str(checkpoint), str(gpu), version, contiguous_linears)
+            _codec(str(checkpoint), str(gpu), version, contiguous_linears, attention_block_size)
             if renderers is None or rank == renderers[0]
             else _geometry_only(version)
         ).with_patch_dim(patch_dim)
+        tokenizer = LidarTokenizer(
+            tokenizer.backend, replace(tokenizer.geometry, fps=lidar_fps)
+        )
         sample = LidarSample(
             controls=torch.empty(0, 3, 128, 1800, device=gpu),
             timestamps=torch.empty(0, device=gpu, dtype=torch.float64),

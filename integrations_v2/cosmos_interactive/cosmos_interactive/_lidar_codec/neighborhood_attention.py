@@ -107,18 +107,19 @@ def _get_block_mask(
     )
 
 
-def _run_attention(query, key, value, block_mask, scale):
+def _run_attention(query, key, value, block_mask, scale, block_size=64):
     head_dim = query.shape[-1]
     # CUDA FlexAttention requires head dimensions >= 16 in some PyTorch
     # versions. Zero padding preserves Q @ K and P @ V with an explicit scale.
     if head_dim < 16:
         query, key, value = (F.pad(t, (0, 16 - head_dim)) for t in (query, key, value))
-    output = flex_attention(query, key, value, block_mask=block_mask, scale=scale, kernel_options=_KERNEL_OPTIONS)
+    options = {**_KERNEL_OPTIONS, "BLOCK_M": block_size, "BLOCK_N": block_size}
+    output = flex_attention(query, key, value, block_mask=block_mask, scale=scale, kernel_options=options)
     return output[..., :head_dim] if head_dim < 16 else output
 
 
 @lru_cache(maxsize=_CACHE_SIZE)
-def _get_compiled_runner(device, shape, kernel, dilation, scale):
+def _get_compiled_runner(device, shape, kernel, dilation, scale, block_size=64):
     # Dynamo caches by code object. A new wrapper around the same code would
     # still hit its recompile limit across decoder levels and partial chunks.
     # Give each static specialization its own code object, without capturing
@@ -127,13 +128,15 @@ def _get_compiled_runner(device, shape, kernel, dilation, scale):
     return torch.compile(runner, fullgraph=True, dynamic=False)
 
 
-def neighborhood_attention_2d(query, key, value, *, kernel_size, dilation, scale):
+def neighborhood_attention_2d(query, key, value, *, kernel_size, dilation, scale, block_size=64):
     """Attend to a fixed 2D window on FP32 [B,H,W,heads,head_dim] tensors.
 
     CUDA always uses compiled sparse attention and propagates failures. Eager
     CPU FlexAttention is available only for small correctness fixtures, since
     PyTorch's eager implementation materializes token-level scores.
     """
+    if type(block_size) is not int or block_size not in (32, 64):
+        raise ValueError("LiDAR attention block_size must be 32 or 64.")
     if query.ndim != 5 or any(t.shape != query.shape for t in (key, value)) or min(query.shape) < 1:
         raise ValueError("LiDAR attention requires matching nonempty [B,H,W,heads,head_dim] tensors.")
     if any(t.dtype != torch.float32 or t.device != query.device for t in (query, key, value)):
@@ -153,17 +156,18 @@ def neighborhood_attention_2d(query, key, value, *, kernel_size, dilation, scale
             for t in (query, key, value)
         )
         runner = (
-            _get_compiled_runner(query.device, tuple(query.shape), kernel, dilation, scale)
+            _get_compiled_runner(query.device, tuple(query.shape), kernel, dilation, scale, block_size)
             if query.is_cuda
             else _run_attention
         )
         with torch.autocast(device_type=query.device.type, enabled=False):
-            output = runner(q, k, v, mask, scale)
+            output = runner(q, k, v, mask, scale, block_size)
     except ValueError:
         raise
     except Exception as exc:
         raise RuntimeError(
             f"Cosmos3 LiDAR FlexAttention failed on {query.device} for shape {tuple(query.shape)}, "
-            f"kernel={kernel}, dilation={dilation}; compiled sparse attention is required on CUDA."
+            f"kernel={kernel}, dilation={dilation}, block_size={block_size}; "
+            "compiled sparse attention is required on CUDA."
         ) from exc
     return output.transpose(1, 2).reshape(batch, height, width, heads, dim).contiguous()

@@ -256,6 +256,12 @@ Add `--lidar` to generate RGB and LiDAR together using the same scene bundle.
 The codec weights download automatically using the model's HF credentials and cache.
 This is substantially slower than RGB-only on a single GPU.
 
+Live LiDAR selects 7.5 Hz for `--chunk-frames 1` and the original 10 Hz for
+the default `--chunk-frames 3`. Use `--lidar-fps 7.5` or `--lidar-fps 10` to
+override this automatic selection. The short-chunk 7.5 Hz path is intended to
+avoid the 1, 1, 2 sweep pattern of 10 Hz; its trained-model quality remains
+unqualified.
+
 For one front-wide RGB view with LiDAR:
 
 ```bash

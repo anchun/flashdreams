@@ -163,6 +163,15 @@ class CosmosInteractiveDriveApplication(InteractiveDriveApplication):
             help="Enable RGB+LiDAR using the model's matching HF V1.2 codec",
         )
         parser.add_argument(
+            "--lidar-fps",
+            type=float,
+            choices=(7.5, 10.0),
+            default=self._settings.lidar_fps,
+            help="Live scan frequency (default: 7.5 Hz for --chunk-frames 1, "
+            "10 Hz otherwise). Explicitly set this to override the automatic "
+            "selection; 7.5 Hz changes trained-model timing.",
+        )
+        parser.add_argument(
             "--lidar-checkpoint",
             type=Path,
             help="Enable RGB+LiDAR with an explicit local codec instead of the HF default",
@@ -177,6 +186,14 @@ class CosmosInteractiveDriveApplication(InteractiveDriveApplication):
             action=argparse.BooleanOptionalAction,
             default=self._settings.lidar_contiguous_linears,
             help="Opt in to contiguous FP32 codec projections (benchmark first)",
+        )
+        parser.add_argument(
+            "--lidar-attention-block-size",
+            type=int,
+            choices=(32, 64),
+            default=self._settings.lidar_attention_block_size,
+            help="FP32 codec attention tile (default: 32; 64 restores the "
+            "compatibility baseline and changes floating-point reduction order)",
         )
         parser.add_argument(
             "--lidar-view",
@@ -227,7 +244,8 @@ class CosmosInteractiveDriveApplication(InteractiveDriveApplication):
             default=self._settings.frames_per_chunk,
             help="Experimental latent frames per autoregressive chunk. The "
             "checkpoint's quality setting is 3; 1 presents four pixel frames "
-            "per chunk with unqualified quality.",
+            "per chunk with unqualified quality. Live LiDAR supports 1 or 3 "
+            "at the selected --lidar-fps.",
         )
         parser.add_argument(
             "--denoise-steps",
@@ -282,12 +300,17 @@ class CosmosInteractiveDriveApplication(InteractiveDriveApplication):
             or args.lidar_checkpoint is not None
             or self._settings.lidar_checkpoint is not None
         )
+        lidar_fps = args.lidar_fps
+        if lidar_fps is None:
+            lidar_fps = 7.5 if args.chunk_frames == 1 else 10.0
         settings = replace(
             self._settings,
             checkpoint=args.checkpoint or self._settings.checkpoint,
             lidar_checkpoint=args.lidar_checkpoint or self._settings.lidar_checkpoint,
+            lidar_fps=lidar_fps,
             lidar_tokenizer_version=args.lidar_tokenizer_version,
             lidar_contiguous_linears=args.lidar_contiguous_linears,
+            lidar_attention_block_size=args.lidar_attention_block_size,
             lidar_view=LidarView(args.lidar_view),
             optimized_lidar_renderer=args.optimized_lidar_renderer,
             culled_lidar_renderer=(

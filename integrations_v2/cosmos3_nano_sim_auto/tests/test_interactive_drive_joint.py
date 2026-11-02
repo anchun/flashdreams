@@ -113,6 +113,7 @@ def test_range_culling_default_and_explicit_override(
     assert app._backend._settings.culled_lidar_renderer is expected
     assert not app._backend._settings.lidar_codec_tf32
     assert not app._backend._settings.lidar_contiguous_linears
+    assert app._backend._settings.lidar_attention_block_size == 32
 
 
 def test_explicit_range_culling_requires_lidar(tmp_path):

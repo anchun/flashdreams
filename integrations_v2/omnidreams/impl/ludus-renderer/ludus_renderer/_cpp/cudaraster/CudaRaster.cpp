@@ -341,12 +341,23 @@ bool CudaRaster::drawTriangles(const int32_t* ranges, bool peel, cudaStream_t st
         int maxRounds = 32;
 
         m_binBatchSize = FW::max(1, FW::min((m_numTris / (roundSize * minBatches)), maxRounds)) * roundSize;
-        m_maxSubtris = FW::max(m_maxSubtris, m_numTris + maxSubtrisSlack);
-        m_maxBinSegs = FW::max(m_maxBinSegs, FW::max(m_numBins * CR_BIN_STREAMS_SIZE, (m_numTris - 1) / CR_BIN_SEG_SIZE + 1) + maxBinSegsSlack);
+        if (m_numTris > m_maxSubtris)
+            m_maxSubtris = FW::min(
+                FW::max(m_numTris + maxSubtrisSlack,
+                        m_numTris + m_numTris / 2),
+                CR_MAXSUBTRIS_SIZE);
+        int requiredBinSegs = FW::max(m_numBins * CR_BIN_STREAMS_SIZE,
+                                     (m_numTris - 1) / CR_BIN_SEG_SIZE + 1);
+        if (requiredBinSegs > m_maxBinSegs)
+            m_maxBinSegs = FW::max(requiredBinSegs + maxBinSegsSlack,
+                                   requiredBinSegs + requiredBinSegs / 2);
         int triTileSegs = (m_numTris - 1) / CR_TILE_SEG_SIZE + 1;
         S64 conservativeTileSegs = (S64)m_numTiles * triTileSegs;
         int targetTileSegs = (int)FW::min(conservativeTileSegs, (S64)(1 << 20));
-        m_maxTileSegs = FW::max(m_maxTileSegs, FW::max(m_numTiles, targetTileSegs) + maxTileSegsSlack);
+        int requiredTileSegs = FW::max(m_numTiles, targetTileSegs);
+        if (requiredTileSegs > m_maxTileSegs)
+            m_maxTileSegs = FW::max(requiredTileSegs + maxTileSegsSlack,
+                                    requiredTileSegs + requiredTileSegs / 2);
 
         // Build CRParams
         CRParams params;
@@ -517,9 +528,12 @@ bool CudaRaster::drawTriangles(const int32_t* ranges, bool peel, cudaStream_t st
                     return false;
                 }
 
-                m_maxSubtris = FW::max(m_maxSubtris, atomics.numSubtris + maxSubtrisSlack);
-                m_maxBinSegs = FW::max(m_maxBinSegs, atomics.numBinSegs + maxBinSegsSlack);
-                m_maxTileSegs = FW::max(m_maxTileSegs, atomics.numTileSegs + maxTileSegsSlack);
+                m_maxSubtris = FW::max(atomics.numSubtris + maxSubtrisSlack,
+                                       m_maxSubtris + m_maxSubtris / 2);
+                m_maxBinSegs = FW::max(atomics.numBinSegs + maxBinSegsSlack,
+                                       m_maxBinSegs + m_maxBinSegs / 2);
+                m_maxTileSegs = FW::max(atomics.numTileSegs + maxTileSegsSlack,
+                                        m_maxTileSegs + m_maxTileSegs / 2);
             }
         };
 

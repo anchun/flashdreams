@@ -250,22 +250,26 @@ class DriveInputState:
     controller_command: DriverCommand | None = None
     """Latest wheel or gamepad command; ``None`` when none is connected."""
 
-    def apply(self, events: UserInputEvents) -> None:
-        """Apply one loop's user-input events to this loop's state."""
+    def apply(self, events: UserInputEvents) -> bool:
+        """Apply input events and report whether effective driving input changed."""
+        changed = False
         for event in events.get_events():
             if isinstance(event, KeyboardUserInputEvent):
                 key = _normalize_drive_key(event.key)
                 if key is None:
                     continue
                 if event.state is KeyboardInputState.PRESSED:
+                    changed = changed or key not in self.pressed_keys
                     self.pressed_keys.add(key)
                 else:
+                    changed = changed or key in self.pressed_keys
                     self.pressed_keys.discard(key)
             elif isinstance(event, FocusUserInputEvent):
                 if not event.focused:
+                    changed = changed or bool(self.pressed_keys)
                     self.pressed_keys.clear()
             elif isinstance(event, GameWheelUserInputEvent):
-                self.controller_command = (
+                command = (
                     None
                     if event.action == "disconnected"
                     else DriverCommand(
@@ -276,8 +280,13 @@ class DriveInputState:
                         manual_control=True,
                     )
                 )
+                changed = changed or command != self.controller_command
+                self.controller_command = command
             elif isinstance(event, GamepadUserInputEvent):
-                self.controller_command = _gamepad_command(event)
+                command = _gamepad_command(event)
+                changed = changed or command != self.controller_command
+                self.controller_command = command
+        return changed
 
     def command(self) -> DriverCommand:
         """Return the command represented by this loop's current input state."""
@@ -320,6 +329,9 @@ class InteractiveDriveModelState:
     first_chunk: bool = True
     drive_input: DriveInputState = field(default_factory=DriveInputState)
     """Driving input updated on the model thread."""
+
+    latency_drive_input: DriveInputState = field(default_factory=DriveInputState)
+    """Independent input state used to profile effective control transitions."""
 
     keyboard_track: KeyboardStateTrack = field(
         default_factory=lambda: KeyboardStateTrack(
@@ -440,6 +452,17 @@ class InteractiveDriveModelState:
             self.pending_prompt = queued.prompt
         self.reset_pending = True
 
+    def agree_on_chunk_frames(self, frames: int | None) -> int:
+        """Broadcast rank zero's chunk-size decision to every model rank."""
+        mesh = self.parallel_context
+        if mesh is not None and mesh.world_size > 1 and dist.is_initialized():
+            payload = [frames if mesh.is_main else None]
+            dist.broadcast_object_list(payload, src=0, group=self._control_group())
+            frames = payload[0]
+        if not isinstance(frames, int) or frames <= 0:
+            raise RuntimeError(f"Invalid agreed chunk size: {frames!r}.")
+        return frames
+
     def set_view_mode(self, view_mode: ViewMode) -> None:
         self.view_mode = view_mode
         if self.ui_loop is not None:
@@ -505,22 +528,59 @@ class InteractiveDriveModelState:
 class InteractiveDriveModelLoop(IModelLoop[InteractiveDriveModelState]):
     """Own scene state, simulation, model cache, and backend execution."""
 
+    def input_latency_received_ns(
+        self, timed_events: Sequence[tuple[Any, int]]
+    ) -> list[int]:
+        """Time effective driving transitions, not repeated browser snapshots."""
+        drive_input = self.state.latency_drive_input
+        return [
+            received_ns
+            for event, received_ns in timed_events
+            if drive_input.apply(UserInputEvents([event]))
+        ]
+
     def step(self, step_index: int, events: UserInputEvents) -> list[StepResult]:
         step_started_at = time.perf_counter()
         state = self.state
-        self._apply_events(events)
+        control_changed = self._apply_events(events)
         state.agree_on_queued()
         if state.scene is None or state.reset_pending:
             self._initialize_rollout()
         assert state.scene is not None
         assert state.vehicle is not None
         assert state.backend is not None
-        chunk_size = (
-            state.backend.initial_chunk_frames
-            if state.first_chunk
-            else state.backend.chunk_frames
-        )
         command = self._command()
+        mesh = state.parallel_context
+        dynamic = bool(getattr(state.backend, "dynamic_chunk_frames", False))
+        choose_here = (
+            not dynamic
+            or mesh is None
+            or mesh.is_main
+            or not dist.is_initialized()
+        )
+        selected_frames: int | None = None
+        if choose_here:
+            choose_frames = getattr(state.backend, "next_chunk_frames", None)
+            selected_frames = (
+                choose_frames(
+                    command,
+                    control_changed=control_changed,
+                    first_chunk=state.first_chunk,
+                    now_s=step_started_at,
+                )
+                if choose_frames is not None
+                else (
+                    state.backend.initial_chunk_frames
+                    if state.first_chunk
+                    else state.backend.chunk_frames
+                )
+            )
+        if dynamic:
+            chunk_size = state.agree_on_chunk_frames(selected_frames)
+        elif not isinstance(selected_frames, int) or selected_frames <= 0:
+            raise RuntimeError(f"Invalid chunk size: {selected_frames!r}.")
+        else:
+            chunk_size = selected_frames
         state.last_command = command
         commands, command_times_s = self._commands(chunk_size)
         trajectory = sample_chunk_trajectory(
@@ -566,6 +626,7 @@ class InteractiveDriveModelLoop(IModelLoop[InteractiveDriveModelState]):
             if finished
             else _telemetry_status(state.vehicle, state.blocks_generated)
         )
+        output_started_at = time.perf_counter()
         results = []
         for output in self._frame_chunk_tensors(chunk):
             if output.shape[0]:
@@ -589,7 +650,11 @@ class InteractiveDriveModelLoop(IModelLoop[InteractiveDriveModelState]):
                     metrics=finalize_metrics,
                 )
             )
+        app_output_ms = (time.perf_counter() - output_started_at) * 1000.0
         model_loop_ms = (time.perf_counter() - step_started_at) * 1000.0
+        if finalize_metrics is not None:
+            finalize_metrics["app_output_ms"] = app_output_ms
+            finalize_metrics["model_loop_ms"] = model_loop_ms
         state._publish_drive_telemetry(chunk, model_loop_ms)
         return results
 
@@ -693,7 +758,7 @@ class InteractiveDriveModelLoop(IModelLoop[InteractiveDriveModelState]):
         state.reset_pending = False
         state.pending_prompt = None
 
-    def _apply_events(self, events: UserInputEvents) -> None:
+    def _apply_events(self, events: UserInputEvents) -> bool:
         state = self.state
         for event in events.get_events():
             if isinstance(event, FocusUserInputEvent):
@@ -720,7 +785,7 @@ class InteractiveDriveModelLoop(IModelLoop[InteractiveDriveModelState]):
                     state.reset_pending = True
                     state._notify("Restart queued.")
                 state.controller_reset_pressed = reset_pressed
-        state.drive_input.apply(events)
+        control_changed = state.drive_input.apply(events)
         keyboard_events = [
             event
             for event in events.get_events()
@@ -753,6 +818,7 @@ class InteractiveDriveModelLoop(IModelLoop[InteractiveDriveModelState]):
             )
             if disposition.tracked
         )
+        return control_changed
 
     def _commands(
         self, frames: int
@@ -1138,21 +1204,31 @@ def _frame_view_tensor(frame: PresentedFrame, view: int, view_mode: ViewMode) ->
         collider_mask = np.any(physx[..., :3] != 0, axis=-1, keepdims=True)
         return _chw_tensor(np.where(collider_mask, physx, hdmap))
     if view_mode == "hdmap":
-        return _chw_tensor(np.asarray(frame.view_rgb_host_uint8[view]))
+        value = frame.view_rgb_host_uint8[view]
+        resident = _lazy_cuda_frame_tensor(value)
+        return resident if resident is not None else _chw_tensor(np.asarray(value))
     model = frame.view_model_rgb_host_uint8
     value = model[view] if model else frame.view_rgb_host_uint8[view]
-    if isinstance(value, LazyCudaFrame):
-        try:
-            resident = value.to_cuda_tensor()
-        except RuntimeError:
-            resident = None
-        if torch.is_tensor(resident):
-            if resident.ndim != 3 or resident.shape[-1] < 3:
-                raise ValueError(
-                    f"Expected HWC frame, received shape {tuple(resident.shape)}"
-                )
-            return resident[..., :3].permute(2, 0, 1)
+    resident = _lazy_cuda_frame_tensor(value)
+    if resident is not None:
+        return resident
     return _chw_tensor(np.asarray(value))
+
+
+def _lazy_cuda_frame_tensor(value: Any) -> Tensor | None:
+    if not isinstance(value, LazyCudaFrame):
+        return None
+    try:
+        resident = value.to_cuda_tensor()
+    except RuntimeError:
+        return None
+    if not torch.is_tensor(resident):
+        return None
+    if resident.ndim != 3 or resident.shape[-1] < 3:
+        raise ValueError(
+            f"Expected HWC frame, received shape {tuple(resident.shape)}"
+        )
+    return resident[..., :3].permute(2, 0, 1)
 
 
 def _chw_tensor(array: npt.NDArray[Any]) -> Tensor:
@@ -1225,9 +1301,12 @@ def _frame_chunk_tensor(
     if output_device:
         output = output.to(device=output_device, non_blocking=True)
     if output_size is not None and output.shape[-2:] != output_size:
+        # ponytail: CUDA float16 bilinear may differ by one level from float32;
+        # restore float32 only if presentation becomes pixel-exact.
+        resize_dtype = torch.float16 if output.is_cuda else torch.float32
         output = (
             F.interpolate(
-                output.float(),
+                output.to(resize_dtype),
                 size=output_size,
                 mode="bilinear",
                 align_corners=False,

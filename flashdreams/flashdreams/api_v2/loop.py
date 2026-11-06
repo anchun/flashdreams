@@ -338,6 +338,17 @@ class IModelLoop(ILoop[StateT], ABC):
     @abstractmethod
     def step(self, step_index: int, events: UserInputEvents) -> list[StepResult]:
         """We expect IModelLoop's to return a list of StepResults, one result per channel."""
+
+    def input_latency_received_ns(
+        self, timed_events: Sequence[tuple[UserInputEvent, int]]
+    ) -> list[int]:
+        """Select which newly read inputs should count toward latency metrics.
+
+        The default preserves the runtime-wide behavior of timing every event.
+        Applications may discard repeated state snapshots while retaining true
+        control transitions.
+        """
+        return [received_ns for _event, received_ns in timed_events]
         ...
 
     @final
@@ -405,7 +416,16 @@ class IModelLoop(ILoop[StateT], ABC):
                 elif stopping:
                     break
                 events, generation = event_buffer.read(reader_id)
-                received_ns = event_buffer.last_read_received_ns(reader_id)
+                timed_events = event_buffer.last_read_timed_events(reader_id)
+                received_ns = self.input_latency_received_ns(timed_events)
+                selected_arrivals = set(received_ns)
+                ignored_arrivals = [
+                    arrived_ns
+                    for _event, arrived_ns in timed_events
+                    if arrived_ns not in selected_arrivals
+                ]
+                if ignored_arrivals:
+                    self.profiler.input_dropped(ignored_arrivals)
                 if step_control is not None:
                     events, generation = step_control.inputs(events, generation)
                 if generation != unpublished_generation:

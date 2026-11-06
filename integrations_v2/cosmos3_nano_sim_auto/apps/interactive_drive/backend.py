@@ -23,17 +23,13 @@ that by admitting steps in lockstep. A thread that decides for itself when to
 generate takes that guarantee away. A render backend is called from the step,
 so lockstep is the default rather than something to arrange.
 
-On the RGB-only path, the chunk sizes do not line the
-two up. The rollout draws its whole control window while it is being built,
-which is several chunks of map before the first chunk is generated and before
-the app has sampled any trajectory at all. So the opening is drawn along the
-path the scene was already on, the app's first commands land on ground whose map
-is drawn, and steering reaches the picture a window later. That is the demo's
-behaviour, and undoing it means teaching the rollout to leave control slots
-unfilled rather than anything here. Joint RGB/LiDAR instead consumes only the
-current control chunk. Its automatic clock uses 7.5 Hz for one-latent chunks
-and 10 Hz for three-latent chunks; both advance four camera frames per RGB
-latent. Both renderers receive the same supplied vehicle path.
+On the fixed RGB-only path, the rollout draws its whole control window while it
+is being built, before the app has sampled any trajectory. Adaptive control
+chunks instead prefill only the opening control and fill each later slot from
+the trajectory the app just supplied. Joint RGB/LiDAR consumes only the current
+control chunk. Its automatic clock uses 7.5 Hz for one-latent chunks and 10 Hz
+for three-latent chunks; both advance four camera frames per RGB latent. Both
+renderers receive the same supplied vehicle path.
 """
 
 from __future__ import annotations
@@ -50,6 +46,7 @@ import torch.distributed as dist
 from interactive_drive.backends.base import RenderBackend
 from interactive_drive.config import ChunkConfig, RasterConfig
 from interactive_drive.types import (
+    DriverCommand,
     FrameChunk,
     PresentedFrame,
     SceneBundle,
@@ -97,6 +94,7 @@ from cosmos3_nano_sim_auto.inputs import (
 )
 from flashdreams.core.distributed.parallel import ParallelContext
 from flashdreams.core.visualization.lidar import LidarView, LidarViewport
+from flashdreams.infra.acceleration.frame_prefetch import LazyCudaFrame
 from flashdreams.infra.profiler import EventProfiler
 from flashdreams.infra.video_output import lazy_rgb_frames_from_video_tensor
 
@@ -180,6 +178,9 @@ class MultiViewSettings:
     LiDAR, only this chunk's, once the host has supplied its poses."""
     prefetch_controls_gpu_offset: int = 0
     """The worker's GPU: this rank's index plus this, modulo the node's count."""
+    adaptive_control_chunks: bool = False
+    """Use one latent while controls are active, then restore the configured
+    stable chunk three seconds after the last control transition."""
 
     parallel: ParallelContext | None = None
     """The mesh this rank runs on, or ``None`` for a drive on one card.
@@ -240,6 +241,29 @@ class MultiViewRenderBackend(RenderBackend):
                 "at this sensor rate is unqualified. Use --lidar-fps 10 to restore "
                 "the original clock."
             )
+        if self._settings.adaptive_control_chunks:
+            if self._settings.frames_per_chunk <= 1:
+                raise ValueError(
+                    "--adaptive-control-chunks requires --chunk-frames greater than 1"
+                )
+            if self._settings.condition_frames != 1:
+                raise ValueError(
+                    "--adaptive-control-chunks requires one opening frame"
+                )
+            if self._settings.lidar_checkpoint is not None:
+                raise ValueError(
+                    "--adaptive-control-chunks is currently RGB-only"
+                )
+            if self._settings.prefetch_controls:
+                raise ValueError(
+                    "--adaptive-control-chunks cannot be combined with "
+                    "--prefetch-controls"
+                )
+            if self._settings.compile_denoise is not None:
+                raise ValueError(
+                    "--adaptive-control-chunks cannot be combined with "
+                    "--compile-denoise"
+                )
         mesh = self._settings.parallel
         # Refused here, before 28 GiB of weights load, rather than by the rollout.
         if (
@@ -272,6 +296,7 @@ class MultiViewRenderBackend(RenderBackend):
         self._chunks = 0
         self._window_ms = 0.0
         self._timings: dict[str, float] = {}
+        self._response_until_s = 0.0
 
     @property
     def initial_chunk_frames(self) -> int:
@@ -289,6 +314,40 @@ class MultiViewRenderBackend(RenderBackend):
     @property
     def chunk_frames(self) -> int:
         return _span_frames(self._settings.frames_per_chunk)
+
+    @property
+    def dynamic_chunk_frames(self) -> bool:
+        return self._settings.adaptive_control_chunks
+
+    def next_chunk_frames(
+        self,
+        command: DriverCommand,
+        *,
+        control_changed: bool,
+        first_chunk: bool,
+        now_s: float,
+    ) -> int:
+        if not self._settings.adaptive_control_chunks:
+            return self.initial_chunk_frames if first_chunk else self.chunk_frames
+        if control_changed:
+            self._response_until_s = now_s + 3.0
+        active = (
+            command.throttle != 0.0
+            or command.brake != 0.0
+            or command.steer != 0.0
+            or command.stop
+            or command.reverse
+        )
+        latent_frames = (
+            1
+            if active or now_s < self._response_until_s
+            else self._settings.frames_per_chunk
+        )
+        return (
+            pixel_frames_for_latents(self._settings.condition_frames + latent_frames)
+            if first_chunk
+            else _span_frames(latent_frames)
+        )
 
     @property
     def can_prewarm(self) -> bool:
@@ -420,7 +479,27 @@ class MultiViewRenderBackend(RenderBackend):
             self._lidar.supply(np.asarray(trajectory.rig_poses_world, dtype=np.float32))
 
         profiler = EventProfiler(device=self._device)
-        trace, _tokens = rollout.step()
+        pixel_frames = len(trajectory.timestamps_us)
+        latent_frames = (
+            (pixel_frames - 1) // WAN_TEMPORAL_COMPRESSION
+            if opening
+            else pixel_frames // WAN_TEMPORAL_COMPRESSION
+        )
+        expected_frames = (
+            pixel_frames_for_latents(self._settings.condition_frames + latent_frames)
+            if opening
+            else _span_frames(latent_frames)
+        )
+        if expected_frames != pixel_frames:
+            raise ValueError(
+                f"Trajectory has {pixel_frames} frames, which is not an exact "
+                "Cosmos latent span."
+            )
+        trace, _tokens = (
+            rollout.step(latent_frames)
+            if self._settings.adaptive_control_chunks
+            else rollout.step()
+        )
         profiler.record("generate")
         latent = rollout.latent_for(self._decoded_to, trace.end)
         self._decoded_to = trace.end
@@ -489,7 +568,7 @@ class MultiViewRenderBackend(RenderBackend):
         frames = int(pixels.shape[1])
         # After that sync, which is what makes the drawing's own events readable.
         # Keep the historical aggregate: this includes control encoding and,
-        # for joint generation, LiDAR rendering. Log the joint stages separately.
+        # for joint generation, LiDAR rendering.
         draw_ms = drawn.take_drawn_ms()
         self._timings = {
             "chunk_start": float(trace.start),
@@ -616,6 +695,7 @@ class MultiViewRenderBackend(RenderBackend):
         # allocating the next scene's assets, including on a direct reset.
         self.reset_scene_conditioning()
         settings = self._settings
+        self._response_until_s = 0.0
         self._frames_emitted = 0
         spec = self._network.config.spec
         patch = spec.vfm.latent_patch_size
@@ -800,6 +880,7 @@ class MultiViewRenderBackend(RenderBackend):
                 attention_scope=settings.attention_scope,
                 maskless_attention=settings.maskless_attention,
                 compile_denoise=settings.compile_denoise,
+                adaptive_chunk_frames=settings.adaptive_control_chunks,
             )
         self._decoded_to = 0
         self._first_chunk_frames = (
@@ -923,18 +1004,7 @@ class _DrawnRig:
         return event
 
     def take_drawn_ms(self) -> float:
-        """Milliseconds the GPU spent drawing since the last chunk asked.
-
-        Drawing happens inside the rollout's step, as it tops up the control it
-        is about to read, so a chunk's own cost can only be told apart here. A
-        chunk usually draws one span and sometimes none at all, the window the
-        prefill drew covering the opening chunks, so this sums whatever arrived.
-        With a worker it is what the step waited for the worker plus the gather,
-        which is the drawing's share of the critical path.
-
-        Only call this after a synchronize: unfinished events raise rather than
-        return a wrong number, and the chunk's own profiler is what waits.
-        """
+        """Return and clear drawing GPU time."""
         spans, self._spans = self._spans, []
         return sum(start.elapsed_time(end) for start, end in spans)
 
@@ -1043,9 +1113,24 @@ def _per_frame(drawn: torch.Tensor, views: int) -> list[tuple[Any, ...]]:
     is the opposite of how a frame is presented.
     """
     frames = drawn.shape[0] // views
-    host = drawn[..., :3].to("cpu").numpy()
+    if not drawn.is_cuda:
+        host = drawn[..., :3].to("cpu").numpy()
+        return [
+            tuple(host[view * frames + index] for view in range(views))
+            for index in range(frames)
+        ]
+    rgb = drawn[..., :3].reshape(views, frames, *drawn.shape[1:3], 3)
+    source_event = torch.cuda.Event()
+    source_event.record(torch.cuda.current_stream(rgb.device))
+    lazy = [
+        [
+            LazyCudaFrame(rgb[view], index, source_event=source_event)
+            for index in range(frames)
+        ]
+        for view in range(views)
+    ]
     return [
-        tuple(host[view * frames + index] for view in range(views))
+        tuple(lazy[view][index] for view in range(views))
         for index in range(frames)
     ]
 

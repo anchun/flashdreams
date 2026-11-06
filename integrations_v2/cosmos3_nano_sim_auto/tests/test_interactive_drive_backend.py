@@ -45,6 +45,7 @@ from cosmos3_nano_sim_auto.impl.conditioning.captions import (
 from cosmos3_nano_sim_auto.impl.packing import ClipGeometry
 from cosmos3_nano_sim_auto.impl.transformer.mask import MASKLESS_SCOPES
 from interactive_drive.config import ChunkConfig, RasterConfig
+from interactive_drive.types import DriverCommand
 from loguru import logger
 
 from flashdreams.core.distributed.parallel import ParallelContext
@@ -116,6 +117,39 @@ def test_the_first_chunk_is_the_opening_frame_and_one_chunk() -> None:
     """
     assert _opening_span(_geometry()) == 17
     assert _opening_span(_geometry(frames_per_chunk=8)) == 33
+
+
+def test_adaptive_chunks_stay_short_until_three_seconds_after_release() -> None:
+    backend = MultiViewRenderBackend(
+        ChunkConfig(),
+        RasterConfig(),
+        settings=MultiViewSettings(
+            device="cpu",
+            frames_per_chunk=3,
+            adaptive_control_chunks=True,
+        ),
+    )
+    neutral = DriverCommand()
+    steering = DriverCommand(steer=1.0, manual_control=True)
+
+    assert backend.next_chunk_frames(
+        neutral, control_changed=False, first_chunk=True, now_s=1.0
+    ) == 13
+    assert backend.next_chunk_frames(
+        steering, control_changed=True, first_chunk=False, now_s=10.0
+    ) == 4
+    assert backend.next_chunk_frames(
+        neutral, control_changed=True, first_chunk=False, now_s=11.0
+    ) == 4
+    assert backend.next_chunk_frames(
+        neutral, control_changed=False, first_chunk=False, now_s=13.999
+    ) == 4
+    assert backend.next_chunk_frames(
+        neutral, control_changed=False, first_chunk=False, now_s=14.0
+    ) == 12
+    assert backend.next_chunk_frames(
+        steering, control_changed=False, first_chunk=False, now_s=20.0
+    ) == 4
 
 
 def _scene(views: int = 1) -> Any:
@@ -339,8 +373,9 @@ def test_a_chunks_drawing_is_timed_on_the_gpu_and_not_billed_to_the_next() -> No
     rig.render(0, 4)
     torch.cuda.synchronize(device)
 
-    assert rig.take_drawn_ms() > 0.0
-    assert rig.take_drawn_ms() == 0.0
+    drawn_ms = rig.take_drawn_ms()
+    assert drawn_ms > 0.0
+    assert rig.take_drawn_ms() == 0
 
 
 class _OtherRanks:
@@ -450,6 +485,7 @@ def test_a_span_splits_into_one_entry_a_frame() -> None:
 
     assert len(split) == 3
     assert all(len(one) == 2 for one in split)
+    assert split[2][1][0, 0, 0] == 1002
 
 
 def _model(views: int, frames: int) -> torch.Tensor:
@@ -685,6 +721,60 @@ def test_the_batch_commands_pipelining_flags_reach_the_drives_settings(
     assert settings.compile_denoise == "max-autotune"
     assert settings.compile_control_encode and settings.prefetch_controls
     assert settings.prefetch_controls_gpu_offset == 2
+
+
+def test_adaptive_control_chunks_reach_the_backend(tmp_path: Path) -> None:
+    from cosmos3_nano_sim_auto.apps.interactive_drive.adapter import (
+        CosmosInteractiveDriveApplication,
+    )
+
+    app = CosmosInteractiveDriveApplication(settings=MultiViewSettings())
+    app.init(
+        [
+            "--scene",
+            str(tmp_path),
+            "--no-ui",
+            "--chunk-frames",
+            "3",
+            "--adaptive-control-chunks",
+        ]
+    )
+
+    assert isinstance(app._backend, MultiViewRenderBackend)
+    assert app._backend._settings.adaptive_control_chunks
+
+
+@pytest.mark.parametrize(
+    "extra, message",
+    [
+        (["--chunk-frames", "1"], "greater than 1"),
+        (["--prefetch-controls"], "prefetch-controls"),
+        (["--compile-denoise", "default"], "compile-denoise"),
+    ],
+)
+def test_adaptive_control_chunks_refuse_incompatible_options(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    extra: list[str],
+    message: str,
+) -> None:
+    from cosmos3_nano_sim_auto.apps.interactive_drive.adapter import (
+        CosmosInteractiveDriveApplication,
+    )
+
+    app = CosmosInteractiveDriveApplication(settings=MultiViewSettings())
+    with pytest.raises(SystemExit):
+        app.init(
+            [
+                "--scene",
+                str(tmp_path),
+                "--no-ui",
+                "--adaptive-control-chunks",
+                *extra,
+            ]
+        )
+
+    assert message in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(

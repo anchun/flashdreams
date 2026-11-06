@@ -371,6 +371,7 @@ def _vision(
     role: int | Tensor,
     is_noisy: bool | Tensor,
     geometry: ClipGeometry,
+    causal_step_id: int | Tensor | None = None,
 ) -> StreamFields:
     """Fields for a block of vision tokens.
 
@@ -391,6 +392,13 @@ def _vision(
         .expand(count)
         .contiguous()
     )
+    step = (
+        causal_steps(frame_id, geometry.frames_per_chunk)
+        if causal_step_id is None
+        else torch.as_tensor(causal_step_id, dtype=torch.long, device=device)
+        .expand(count)
+        .contiguous()
+    )
     return StreamFields(
         sample_id=torch.zeros(count, dtype=torch.long, device=device),
         frame_id=frame_id,
@@ -399,7 +407,7 @@ def _vision(
         is_control=role_id == ROLE_CONTROL,
         timestamp=frame_id.to(torch.float32) * geometry.seconds_per_frame,
         token_role_id=role_id,
-        causal_step_id=causal_steps(frame_id, geometry.frames_per_chunk),
+        causal_step_id=step,
     )
 
 
@@ -517,9 +525,11 @@ def _check_ranges(
 def build_memory_layout(
     geometry: ClipGeometry,
     *,
-    control_frame_ranges: Sequence[tuple[int, int]] | None = None,
+    control_frame_ranges: Sequence[tuple[int, int] | None] | None = None,
+    control_step_ids: Sequence[int | None] | None = None,
     control_slot_frames: int | None = None,
-    history_frame_ranges: Sequence[tuple[int, int]] = (),
+    history_frame_ranges: Sequence[tuple[int, int] | None] = (),
+    history_step_ids: Sequence[int | None] | None = None,
     history_slot_frames: int | None = None,
     capacity: int | None = None,
     device: torch.device | None = None,
@@ -551,11 +561,20 @@ def build_memory_layout(
     device = device or torch.device("cpu")
     num_views, spatial_tokens = geometry.num_views, geometry.spatial_tokens
 
-    def stamped(start: int, end: int, role: int) -> StreamFields:
+    def stamped(
+        start: int, end: int, role: int, causal_step_id: int | None = None
+    ) -> StreamFields:
         frame, view = _stamp_view_major(
             torch.arange(start, end, device=device), num_views, spatial_tokens
         )
-        return _vision(frame, view, role=role, is_noisy=False, geometry=geometry)
+        return _vision(
+            frame,
+            view,
+            role=role,
+            is_noisy=False,
+            geometry=geometry,
+            causal_step_id=causal_step_id,
+        )
 
     if control_frame_ranges is None:
         if geometry.frames_per_view is None:
@@ -564,29 +583,52 @@ def build_memory_layout(
                 "Pass the window the cache holds as control_frame_ranges."
             )
         control_frame_ranges = [(0, geometry.frames_per_view)]
+    if control_step_ids is None:
+        control_step_ids = [None] * len(control_frame_ranges)
+    if len(control_step_ids) != len(control_frame_ranges):
+        raise ValueError("control_step_ids must match control_frame_ranges")
+    if history_step_ids is None:
+        history_step_ids = [None] * len(history_frame_ranges)
+    if len(history_step_ids) != len(history_frame_ranges):
+        raise ValueError("history_step_ids must match history_frame_ranges")
+    real_controls = [r for r in control_frame_ranges if r is not None]
+    real_history = [r for r in history_frame_ranges if r is not None]
     # The conditioning frames' map is pinned like their RGB, so as history
     # rotates the chunk ranges can sit apart from it, exactly as RGB history
     # sits apart from the conditioning frames. Each side must still be unbroken.
-    opening = [r for r in control_frame_ranges if r[1] <= geometry.condition_frames]
+    opening = [r for r in real_controls if r[1] <= geometry.condition_frames]
     _check_ranges(
         opening, first_frame=0, last_frame=geometry.condition_frames, what="Control"
     )
     _check_ranges(
-        [r for r in control_frame_ranges if r[1] > geometry.condition_frames],
+        [r for r in real_controls if r[1] > geometry.condition_frames],
         first_frame=max((end for _start, end in opening), default=0),
         last_frame=geometry.frames_per_view,
         what="Control",
     )
     _check_ranges(
-        history_frame_ranges,
+        real_history,
         first_frame=geometry.condition_frames,
         last_frame=geometry.frames_per_view,
         what="History",
     )
 
     sections = []
-    for start, end in control_frame_ranges:
-        sections.append(stamped(start, end, ROLE_CONTROL))
+    for frame_range, step_id in zip(
+        control_frame_ranges, control_step_ids, strict=True
+    ):
+        if frame_range is None:
+            if control_slot_frames is None:
+                raise ValueError("Empty control slots need control_slot_frames")
+            sections.append(
+                _padding(
+                    control_slot_frames * num_views * spatial_tokens,
+                    device,
+                )
+            )
+            continue
+        start, end = frame_range
+        sections.append(stamped(start, end, ROLE_CONTROL, step_id))
         short = (
             0 if control_slot_frames is None else control_slot_frames - (end - start)
         )
@@ -599,8 +641,21 @@ def build_memory_layout(
             sections.append(_padding(short * num_views * spatial_tokens, device))
     if geometry.condition_frames:
         sections.append(stamped(0, geometry.condition_frames, ROLE_TARGET_CONDITION))
-    for start, end in history_frame_ranges:
-        sections.append(stamped(start, end, ROLE_CLEAN_TARGET))
+    for frame_range, step_id in zip(
+        history_frame_ranges, history_step_ids, strict=True
+    ):
+        if frame_range is None:
+            if history_slot_frames is None:
+                raise ValueError("Empty history slots need history_slot_frames")
+            sections.append(
+                _padding(
+                    history_slot_frames * num_views * spatial_tokens,
+                    device,
+                )
+            )
+            continue
+        start, end = frame_range
+        sections.append(stamped(start, end, ROLE_CLEAN_TARGET, step_id))
         short = (
             0 if history_slot_frames is None else history_slot_frames - (end - start)
         )
@@ -730,6 +785,7 @@ def build_chunk_metadata(
     *,
     chunk_start: int,
     chunk_frames: int,
+    causal_step_id: int | None = None,
     text_tokens: int,
     view_text_tokens: Sequence[int] | None = None,
     pass_kind: ChunkPassKind = "noisy",
@@ -801,6 +857,7 @@ def build_chunk_metadata(
             else (ROLE_CURRENT_TARGET if noisy else ROLE_CLEAN_TARGET),
             is_noisy=noisy,
             geometry=geometry,
+            causal_step_id=causal_step_id,
         ),
         chunk_capacity,
         device,

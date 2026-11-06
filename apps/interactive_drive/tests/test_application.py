@@ -150,6 +150,41 @@ def test_gamepad_left_stick_only_steers() -> None:
     assert command.brake == 0.0
 
 
+def test_drive_input_reports_each_effective_transition_in_a_complete_tap() -> None:
+    drive_input = core_module.DriveInputState()
+    press = KeyboardUserInputEvent(
+        timestamp=np.uint64(0),
+        key="a",
+        state=KeyboardInputState.PRESSED,
+    )
+
+    assert drive_input.apply(
+        UserInputEvents([press, replace(press, state=KeyboardInputState.RELEASED)])
+    )
+    assert not drive_input.pressed_keys
+    assert not drive_input.apply(UserInputEvents([replace(press, key="q")]))
+
+
+def test_input_latency_ignores_repeated_keyboard_state_snapshots() -> None:
+    loop = InteractiveDriveModelLoop()
+    loop.state = cast(
+        Any,
+        SimpleNamespace(latency_drive_input=core_module.DriveInputState()),
+    )
+    press = KeyboardUserInputEvent(
+        timestamp=np.uint64(0),
+        key="a",
+        state=KeyboardInputState.PRESSED,
+    )
+    release = replace(press, state=KeyboardInputState.RELEASED)
+
+    received = loop.input_latency_received_ns(
+        [(press, 10), (press, 20), (release, 30), (release, 40)]
+    )
+
+    assert received == [10, 30]
+
+
 def test_s_reverses_and_space_matches_controller_brake_input() -> None:
     reverse = command_from_snapshot(ControlSnapshot(pressed={"s"}))
     brake = command_from_snapshot(ControlSnapshot(pressed={" "}))
@@ -362,7 +397,7 @@ def test_model_step_publishes_bev_channel_and_complete_elapsed_time(
     )
     elapsed: list[float] = []
     trajectory_calls: list[dict[str, Any]] = []
-    clock = iter((10.0, 10.123))
+    clock = iter((10.0, 10.100, 10.110, 10.123))
     monkeypatch.setattr(core_module.time, "perf_counter", lambda: next(clock))
 
     def sample_trajectory(**kwargs: Any) -> Any:
@@ -403,6 +438,9 @@ def test_model_step_publishes_bev_channel_and_complete_elapsed_time(
     assert elapsed == [pytest.approx(123.0)]
     assert trajectory_calls[0]["physics_world"] is physics_world
     assert trajectory_calls[0]["capture_physics_debug"] is True
+    assert results[0].metrics is not None
+    assert results[0].metrics["model_loop_ms"] == pytest.approx(123.0)
+    assert results[0].metrics["app_output_ms"] >= 0.0
 
 
 def test_a_worker_ranks_step_generates_but_presents_nothing(
@@ -1512,6 +1550,54 @@ def test_frame_view_delegates_cuda_readiness_to_lazy_frame(
     assert calls == [("wait", event), ("record", stream)]
 
 
+def test_hdmap_view_delegates_cuda_readiness_to_lazy_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame = LazyCudaFrame(torch.full((1, 2, 3, 3), 31, dtype=torch.uint8), 0)
+    chunk = cast(
+        Any,
+        SimpleNamespace(
+            frames=[
+                PresentedFrame(
+                    timestamp_us=0,
+                    view_rgb_host_uint8=(frame,),
+                    depth_host_f32=None,
+                )
+            ]
+        ),
+    )
+
+    output = core_module._frame_chunk_tensor(chunk, "hdmap")
+
+    assert tuple(output.shape) == (1, 3, 2, 3)
+    assert output[0, 0, 0, 0] == 31
+
+
+def test_presentation_resize_stays_within_one_level_of_float_reference() -> None:
+    frame = _rig_model_frame(1, height=3, width=5)
+    chunk = cast(Any, SimpleNamespace(frames=[frame]))
+    source = core_module._frame_chunk_tensor(chunk, "rgb")
+    reference = (
+        torch.nn.functional.interpolate(
+            source.float(),
+            size=(6, 10),
+            mode="bilinear",
+            align_corners=False,
+        )
+        .round()
+        .clamp(0, 255)
+        .to(torch.uint8)
+    )
+
+    output = core_module._frame_chunk_tensor(
+        chunk, "rgb", output_size=(6, 10)
+    )
+
+    difference = (output.to(torch.int16) - reference.to(torch.int16)).abs()
+    assert output.dtype == torch.uint8
+    assert difference.max() <= 1
+
+
 def test_interactive_drive_discovers_scenes_and_weather_variants(
     tmp_path: Path,
 ) -> None:
@@ -1582,6 +1668,33 @@ def test_closing_a_session_lets_go_of_the_group_its_buttons_agreed_over(
 
     assert released == [group]
     assert model_loop.state.control_group is None
+
+
+def test_a_worker_uses_rank_zeros_chunk_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = InteractiveDriveModelState(
+        backend_factory=lambda _: None,
+        config=cast(Any, SimpleNamespace()),
+        desc=cast(Any, SimpleNamespace()),
+        scene_loader=lambda *args: object(),
+        parallel_context=replace(
+            ParallelContext.single("cpu"), cp_rank=1, cp_size=2
+        ),
+    )
+    group = object()
+    state.control_group = group
+    monkeypatch.setattr(core_module.dist, "is_initialized", lambda: True)
+
+    def broadcast(payload: list[Any], *, src: int, group: Any) -> None:
+        assert src == 0
+        assert group is state.control_group
+        assert payload == [None]
+        payload[0] = 4
+
+    monkeypatch.setattr(core_module.dist, "broadcast_object_list", broadcast)
+
+    assert state.agree_on_chunk_frames(None) == 4
 
 
 def test_an_ordinary_restart_asks_for_no_prompt_of_its_own(

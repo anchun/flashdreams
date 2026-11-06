@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 
 from interactive_drive.config import ChunkConfig, RasterConfig
 from interactive_drive.types import (
+    DriverCommand,
     FrameChunk,
     PresentedFrame,
     SceneBundle,
@@ -30,6 +31,23 @@ class RenderBackend(ABC):
     @property
     def chunk_frames(self) -> int:
         return self._chunk.chunk_frames
+
+    @property
+    def dynamic_chunk_frames(self) -> bool:
+        """Whether rank zero must synchronize per-step chunk-size decisions."""
+        return False
+
+    def next_chunk_frames(
+        self,
+        command: DriverCommand,
+        *,
+        control_changed: bool,
+        first_chunk: bool,
+        now_s: float,
+    ) -> int:
+        """Choose the next simulation chunk before its trajectory is sampled."""
+        del command, control_changed, now_s
+        return self.initial_chunk_frames if first_chunk else self.chunk_frames
 
     @property
     def can_prewarm(self) -> bool:

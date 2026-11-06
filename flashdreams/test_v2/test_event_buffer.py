@@ -77,3 +77,20 @@ def test_each_read_reports_when_its_events_reached_the_runtime() -> None:
 
     assert len(first) == 2 and first[0] == first[1], "one stamp per batch"
     assert len(second) == 1 and second[0] >= first[0]
+
+
+def test_timed_events_keep_server_arrival_pairs_when_client_clocks_reorder() -> None:
+    buffer = EventBuffer()
+    buffer.register(0)
+    later_client_event = _move(10, 0.1)
+    earlier_client_event = _move(5, 0.2)
+    buffer.append(UserInputEvents([later_client_event]), received_ns=100)
+    buffer.append(UserInputEvents([earlier_client_event]), received_ns=200)
+
+    sorted_events, _ = buffer.read(0)
+
+    assert [event.timestamp for event in sorted_events.get_events()] == [5, 10]
+    assert buffer.last_read_timed_events(0) == [
+        (later_client_event, 100),
+        (earlier_client_event, 200),
+    ]

@@ -699,6 +699,101 @@ def run_to_end(rollout: ChunkRollout) -> torch.Tensor:
     return rollout.result().latent
 
 
+def adaptive() -> ChunkRollout:
+    geometry = ClipGeometry(
+        num_views=2,
+        frames_per_view=10,
+        patch_h=1,
+        patch_w=2,
+        frames_per_chunk=3,
+        condition_frames=1,
+    )
+    _controls, text_ids = inputs()
+    return ChunkRollout(
+        build(),
+        geometry=geometry,
+        control_tokens=torch.randn(
+            geometry.num_views * geometry.frames_per_view * geometry.spatial_tokens,
+            PATCH_DIM,
+        ),
+        text_ids=text_ids,
+        condition_tokens=torch.randn(
+            geometry.num_views * geometry.spatial_tokens, PATCH_DIM
+        ),
+        history_frames=3,
+        adaptive_chunk_frames=True,
+    )
+
+
+def test_adaptive_chunks_keep_actual_boundaries_and_frame_budget() -> None:
+    rollout = adaptive()
+
+    for frames in (1, 1, 1):
+        rollout.step(frames)
+
+    assert rollout._history == [(1, 2), (2, 3), (3, 4)]
+    assert rollout._slot_steps == [1, 2, 3]
+    assert set(rollout._control_ranges or ()) == {
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 4),
+        None,
+    }
+    memory = rollout._memory().stream
+    for frame, step in ((0, 0), (1, 1), (2, 2), (3, 3)):
+        selected = (
+            (memory.token_role_id == ROLE_CONTROL) & (memory.frame_id == frame)
+        )
+        assert set(memory.causal_step_id[selected].tolist()) == {step}
+    for frame, step in ((1, 1), (2, 2), (3, 3)):
+        selected = (
+            (memory.token_role_id == ROLE_CLEAN_TARGET)
+            & (memory.frame_id == frame)
+        )
+        assert set(memory.causal_step_id[selected].tolist()) == {step}
+
+    rollout.step(3)
+
+    assert rollout._history == [(4, 7)]
+    assert rollout._slot_steps == [4, None, None]
+    assert rollout.next_range == (7, 10)
+
+
+def test_adaptive_chunks_reject_invalid_sizes() -> None:
+    rollout = adaptive()
+
+    with pytest.raises(ValueError, match=r"\[1, 3\]"):
+        rollout.step(0)
+    with pytest.raises(ValueError, match=r"\[1, 3\]"):
+        rollout.step(4)
+
+
+def test_adaptive_chunks_reject_fixed_shape_optimizations() -> None:
+    geometry = dataclasses.replace(ROLLING, frames_per_chunk=3)
+    _controls, text_ids = inputs()
+    kwargs = {
+        "geometry": geometry,
+        "control_tokens": torch.randn(
+            geometry.num_views
+            * geometry.frames_per_view
+            * geometry.spatial_tokens,
+            PATCH_DIM,
+        ),
+        "text_ids": text_ids,
+        "condition_tokens": torch.randn(
+            geometry.num_views * geometry.spatial_tokens, PATCH_DIM
+        ),
+        "history_frames": 3,
+        "adaptive_chunk_frames": True,
+    }
+
+    with pytest.raises(ValueError, match="compile_denoise"):
+        ChunkRollout(build(), compile_denoise="default", **kwargs)
+    with pytest.raises(ValueError, match="attention_kv_arena"):
+        ChunkRollout(build(), attention_kv_arena=True, **kwargs)
+
+
 def test_a_window_the_clip_already_fits_changes_nothing_at_all() -> None:
     """The whole point of the bound is that it is invisible until it bites.
 

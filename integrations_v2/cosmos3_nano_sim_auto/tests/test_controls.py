@@ -13,8 +13,13 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
 import pytest
 import torch
+from cosmos3_nano_sim_auto.impl.conditioning.ludus_controls import (
+    DrawnCamera,
+    LudusControls,
+)
 from cosmos3_nano_sim_auto.impl.conditioning.controls import (
     available_pixel_frames,
     writable,
@@ -24,6 +29,95 @@ from cosmos3_nano_sim_auto.impl.conditioning.controls import (
 from flashdreams.infra.runner_io import video_tensor_to_uint8
 
 pytestmark = pytest.mark.ci_cpu
+
+
+def test_cuda_control_render_does_not_synchronize_the_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Controls(LudusControls):
+        def _drawn(self, view, camera, spanned, driven, bolted):
+            return torch.zeros((len(spanned), 1, 1, 3), dtype=torch.uint8)
+
+    notes: list[str] = []
+    context = type(
+        "_Context",
+        (),
+        {"upload_cameras": lambda self, cameras: None},
+    )()
+    camera = DrawnCamera(
+        name="front",
+        camera=None,
+        drawn=(1, 1),
+        thinner=1.0,
+        track=np.eye(4)[None],
+    )
+    controls = _Controls(
+        context,
+        0,
+        [camera],
+        start_us=0,
+        fps=30,
+        widths={},
+        device="cuda",
+        note=notes.append,
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "synchronize",
+        lambda *_: pytest.fail("render must remain asynchronous"),
+    )
+
+    assert controls.render(0, 1).shape == (1, 1, 1, 3)
+    assert "queued frames [0, 1)" in notes[0]
+
+
+def test_control_render_uses_the_uniform_query_path_and_reuses_configuration() -> None:
+    class _Context:
+        def __init__(self) -> None:
+            self.camera_uploads = 0
+            self.width_uploads = 0
+            self.queries: list[dict[str, Any]] = []
+
+        def upload_cameras(self, cameras) -> None:
+            self.camera_uploads += 1
+
+        def set_line_widths(self, **widths) -> None:
+            pass
+
+        def upload_width_table(self, widths) -> None:
+            self.width_uploads += 1
+
+        def render_uniform(self, **query):
+            self.queries.append(query)
+            count = len(query["timestamps_us"])
+            return torch.zeros((count, 1, 1, 4), dtype=torch.uint8)
+
+    context = _Context()
+    camera = DrawnCamera(
+        name="front",
+        camera=object(),
+        drawn=(1, 1),
+        thinner=1.0,
+        track=np.repeat(np.eye(4)[None], 2, axis=0),
+    )
+    controls = LudusControls(
+        context,
+        3,
+        [camera],
+        start_us=100,
+        fps=10,
+        widths={1: 2.0},
+        device="cpu",
+    )
+
+    controls.render(0, 1)
+    controls.render(1, 2)
+
+    assert context.camera_uploads == 1
+    assert context.width_uploads == 1
+    assert [query["scene_id"] for query in context.queries] == [3, 3]
+    assert [query["camera_id"] for query in context.queries] == [0, 0]
+    assert [query["timestamps_us"] for query in context.queries] == [[100], [100100]]
 
 
 def _clip(path, frames: int):

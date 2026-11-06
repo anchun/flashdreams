@@ -248,6 +248,15 @@ class CosmosInteractiveDriveApplication(InteractiveDriveApplication):
             "at the selected --lidar-fps.",
         )
         parser.add_argument(
+            "--adaptive-control-chunks",
+            action="store_true",
+            default=self._settings.adaptive_control_chunks,
+            help="Use one latent per chunk while driving and for 3 seconds "
+            "after the last control change, then restore --chunk-frames. "
+            "RGB-only; incompatible with --prefetch-controls and "
+            "--compile-denoise.",
+        )
+        parser.add_argument(
             "--denoise-steps",
             type=int,
             default=self._settings.denoise_steps,
@@ -323,6 +332,7 @@ class CosmosInteractiveDriveApplication(InteractiveDriveApplication):
             if args.compile_denoise == "off"
             else args.compile_denoise,
             frames_per_chunk=args.chunk_frames,
+            adaptive_control_chunks=args.adaptive_control_chunks,
             denoise_steps=(
                 None if args.denoise_steps == 0 else args.denoise_steps
             ),
@@ -346,6 +356,23 @@ class CosmosInteractiveDriveApplication(InteractiveDriveApplication):
             )
         if settings.prefetch_controls_gpu_offset and not settings.prefetch_controls:
             parser.error("--prefetch-controls-gpu-offset requires --prefetch-controls")
+        if settings.adaptive_control_chunks:
+            if settings.frames_per_chunk <= 1:
+                parser.error(
+                    "--adaptive-control-chunks requires --chunk-frames greater than 1"
+                )
+            if lidar_enabled:
+                parser.error("--adaptive-control-chunks is currently RGB-only")
+            if settings.prefetch_controls:
+                parser.error(
+                    "--adaptive-control-chunks cannot be combined with "
+                    "--prefetch-controls"
+                )
+            if settings.compile_denoise is not None:
+                parser.error(
+                    "--adaptive-control-chunks cannot be combined with "
+                    "--compile-denoise"
+                )
         if lidar_enabled and "--help" not in shared and "-h" not in shared:
             from cosmos_interactive.checkpoint_load import resolve_checkpoint_source
 

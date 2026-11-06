@@ -150,6 +150,8 @@ class LudusControls:
         self._device = torch.device(device)
         self._note = note
         self._drive = drive
+        self._context.upload_cameras([camera.camera for camera in cameras])
+        self._configured_camera: int | None = None
         # Where each camera sits relative to the one the driver steers, read off
         # the frame the run starts at. The rig is bolted together, so this holds
         # for every frame; taking it from the start rather than averaging keeps
@@ -222,24 +224,26 @@ class LudusControls:
             return torch.empty((0, 0, 0, 3), dtype=torch.uint8, device=self._device)
         frames = torch.cat(
             [
-                self._drawn(self._cameras[view], spanned, driven, self._bolted[view])
+                self._drawn(
+                    view,
+                    self._cameras[view],
+                    spanned,
+                    driven,
+                    self._bolted[view],
+                )
                 for view in drawn
             ]
         )
-        # Synchronised before the clock is read, because a render call returns
-        # as soon as it is queued. Unsynchronised, this would report the launch
-        # and read as though drawing were free, which is the wrong thing to
-        # believe about the one stage of a chunk that is ours.
-        if self._device.type == "cuda":
-            torch.cuda.synchronize(self._device)
+        action = "queued" if self._device.type == "cuda" else "drew"
         self._note(
-            f"  drew frames [{first}, {last}) for {len(drawn)} camera(s) "
+            f"  {action} frames [{first}, {last}) for {len(drawn)} camera(s) "
             f"in {time.perf_counter() - started:.2f}s"
         )
         return frames
 
     def _drawn(
         self,
+        view: int,
         camera: DrawnCamera,
         spanned: np.ndarray,
         driven: np.ndarray | None,
@@ -247,32 +251,27 @@ class LudusControls:
     ) -> Tensor:
         """One camera's span, drawn at its own size and shrunk to the model's.
 
-        A call draws at one size and through one width table, so a camera is
-        uploaded with its own before it is asked for. One call a camera is more
-        calls than the rig needs -- cameras sharing a lens shape could go in
-        one -- and correctness does not depend on the grouping, only the cost.
+        Cameras are uploaded together when the clip opens, and their packed
+        intrinsics stay cached across chunks. A call still draws at one size
+        and through one width table, so only a change of camera needs to update
+        that camera's line style.
         """
-        self._context.upload_cameras([camera.camera])
-        self._context.set_line_widths(
-            wireframe=camera_math.OUTLINE_WIDTH * camera.thinner
-        )
-        self._context.upload_width_table(
-            {prim: width * camera.thinner for prim, width in self._widths.items()}
-        )
+        if self._configured_camera != view:
+            self._context.set_line_widths(
+                wireframe=camera_math.OUTLINE_WIDTH * camera.thinner
+            )
+            self._context.upload_width_table(
+                {prim: width * camera.thinner for prim, width in self._widths.items()}
+            )
+            self._configured_camera = view
 
-        count = int(spanned.size)
-        images = self._context.render(
-            scene_ids=torch.full(
-                (count,), self._scene_id, dtype=torch.int32, device=self._device
-            ),
-            camera_ids=torch.zeros(count, dtype=torch.int32, device=self._device),
-            timestamps_us=torch.tensor(
-                [self._at(int(frame)) for frame in spanned],
-                dtype=torch.int64,
-                device=self._device,
-            ),
-            camera_type_ids=torch.zeros(count, dtype=torch.int32, device=self._device),
-            camera_poses=self._poses(camera, spanned, driven, bolted),
+        poses = self._poses(camera, spanned, driven, bolted)
+        images = self._context.render_uniform(
+            scene_id=self._scene_id,
+            camera_id=view,
+            timestamps_us=[self._at(int(frame)) for frame in spanned],
+            camera_type_id=0,
+            camera_poses=poses,
             resolution=(camera.drawn[1], camera.drawn[0]),
         )
         return _shrunk(images, FED)

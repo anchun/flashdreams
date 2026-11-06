@@ -24,6 +24,7 @@ import json
 import queue
 import subprocess
 import threading
+from collections.abc import Sequence
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import ContextManager, Iterator
@@ -1149,6 +1150,22 @@ def test_a_reset_ends_the_wait_of_input_whose_output_was_discarded(
         "the discarded key's wait ends, and so does the key shown after the reset"
     )
     assert latency._count == 2, "the second key and the reset, never the first key"
+
+
+def test_a_model_loop_can_exclude_repeated_state_inputs_from_latency() -> None:
+    class _EdgeOnlyLoop(_BufferingLoop):
+        def input_latency_received_ns(
+            self, timed_events: Sequence[tuple[UserInputEvent, int]]
+        ) -> list[int]:
+            del timed_events
+            return []
+
+    latency = InputLatencyProfiler()
+    loop = _EdgeOnlyLoop(latency, {1})
+
+    loop.run(steps=1)
+
+    assert latency._count == 0
 
 
 def test_profile_wraps_the_runner_console_script(

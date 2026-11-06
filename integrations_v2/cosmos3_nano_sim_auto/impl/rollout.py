@@ -122,6 +122,7 @@ class _ChunkMaskArgs(TypedDict):
 
     chunk_start: int
     chunk_frames: int
+    causal_step_id: int | None
     device: torch.device
     attention_impl: OptimizedImplConfig
     scope: AttentionScope
@@ -511,6 +512,7 @@ class ChunkRollout:
         attention_kv_arena: bool = False,
         history_frames: int | None = None,
         token_frames: int | None = None,
+        adaptive_chunk_frames: bool = False,
         compile_denoise: str | None = None,
         attention_scope: AttentionScope = "all_views",
         maskless_attention: bool = False,
@@ -536,6 +538,11 @@ class ChunkRollout:
                 decode can use. Generation never reads these back, so this
                 cannot change the picture.
 
+            adaptive_chunk_frames: Let :meth:`step` request between one latent
+                frame and ``geometry.frames_per_chunk``. Cache slots keep their
+                maximum width, while attention metadata follows the actual
+                chunk boundaries.
+
             Everything else: see :func:`run_rollout`, which takes the same set.
 
         Raises:
@@ -544,6 +551,22 @@ class ChunkRollout:
         """
         if fused_attention_merge and not maskless_attention:
             raise ValueError("fused_attention_merge requires maskless_attention")
+        if adaptive_chunk_frames and geometry.condition_frames != 1:
+            raise ValueError(
+                "adaptive_chunk_frames requires one conditioning frame"
+            )
+        if adaptive_chunk_frames and history_frames is None:
+            raise ValueError(
+                "adaptive_chunk_frames requires a bounded history_frames window"
+            )
+        if adaptive_chunk_frames and compile_denoise is not None:
+            raise ValueError(
+                "adaptive_chunk_frames cannot be combined with compile_denoise"
+            )
+        if adaptive_chunk_frames and attention_kv_arena:
+            raise ValueError(
+                "adaptive_chunk_frames cannot be combined with attention_kv_arena"
+            )
         vfm = network.config.spec.vfm
         width = vfm.patch_latent_dim
         geometry.latent_hw(vfm.latent_patch_size)
@@ -683,6 +706,7 @@ class ChunkRollout:
         self._maskless = maskless_attention
         self._fused_merge = fused_attention_merge
         self._window = decomposed_temporal_window_seconds
+        self._adaptive_chunk_frames = adaptive_chunk_frames
         # Built here rather than per chunk: compiling is only worth its cost if
         # one compilation serves every chunk.
         self._flow = _flow_fn(
@@ -703,7 +727,12 @@ class ChunkRollout:
                 history_frames if committed is None else min(history_frames, committed)
             )
         assert kept is not None
-        self._slots = -(-kept // geometry.frames_per_chunk)
+        self._history_frames = kept
+        self._slots = (
+            kept
+            if adaptive_chunk_frames
+            else -(-kept // geometry.frames_per_chunk)
+        )
 
         chunk = geometry.frames_per_chunk
         per_frame = geometry.num_views * self._spatial
@@ -716,16 +745,42 @@ class ChunkRollout:
         window = (
             None if history_frames is None else control_window(geometry, self._slots)
         )
-        streaming = window is not None and (
-            geometry.frames_per_view is None or window[-1][1] < geometry.frames_per_view
+        streaming = adaptive_chunk_frames or (
+            window is not None
+            and (
+                geometry.frames_per_view is None
+                or window[-1][1] < geometry.frames_per_view
+            )
         )
-        self._control_slots = len(window) if streaming and window else 0
-        self._control_ranges: list[tuple[int, int]] | None = (
-            list(window) if streaming and window is not None else None
+        if adaptive_chunk_frames:
+            self._control_slots = self._slots + 2
+            self._control_ranges: list[tuple[int, int] | None] | None = [
+                (0, geometry.condition_frames),
+                *([None] * (self._control_slots - 1)),
+            ]
+        else:
+            self._control_slots = len(window) if streaming and window else 0
+            self._control_ranges = (
+                list(window) if streaming and window is not None else None
+            )
+        self._control_step_ids: list[int | None] | None = (
+            [
+                0 if frame_range is not None else None
+                for frame_range in self._control_ranges
+            ]
+            if adaptive_chunk_frames and self._control_ranges is not None
+            else None
         )
         self._control_frames = (
-            self._control_ranges[-1][1]
-            if self._control_ranges
+            max(
+                (
+                    frame_range[1]
+                    for frame_range in self._control_ranges
+                    if frame_range is not None
+                ),
+                default=0,
+            )
+            if self._control_ranges is not None
             else geometry.frames_per_view
         )
 
@@ -744,6 +799,8 @@ class ChunkRollout:
         # is the order `build_memory_layout` is given. Chronological until the
         # slots are full and the oldest starts being reused.
         self._slot_frames: list[tuple[int, int] | None] = [None] * self._slots
+        self._slot_steps: list[int | None] = [None] * self._slots
+        self._written_slots = 0
         self._control_next = self._control_frames
         self._controls = controls
 
@@ -763,8 +820,13 @@ class ChunkRollout:
                 native_gqa_attention=native_gqa_attention,
                 attention_impl=self._attention_impl,
                 accelerated_rms_norm=accelerated_rms_norm,
-                control_ranges=self._control_ranges,
+                control_ranges=(
+                    [r for r in self._control_ranges if r is not None]
+                    if self._control_ranges is not None
+                    else None
+                ),
                 control_slot_frames=chunk if streaming else None,
+                control_slot_count=self._control_slots if streaming else None,
                 scope=attention_scope,
                 maskless=maskless_attention,
                 deduplicate_cross_view=self._deduplicate_cross_view,
@@ -790,8 +852,9 @@ class ChunkRollout:
             # cameras and controls are retained and evicted together.
             control_pinned_slots=sum(
                 1
-                for _start, end in self._control_ranges or ()
-                if end <= geometry.condition_frames
+                for frame_range in self._control_ranges or ()
+                if frame_range is not None
+                and frame_range[1] <= geometry.condition_frames
             ),
             text_prefilled=text_kv if attention_kv_arena else None,
             attention_current_tokens=chunk * per_frame if attention_kv_arena else 0,
@@ -827,7 +890,7 @@ class ChunkRollout:
                 ),
             )
 
-        self._chunk_count = plan.count
+        self._chunk_count = None if adaptive_chunk_frames else plan.count
         self._next = 0
         self._frame = geometry.condition_frames
         self._stopped = False
@@ -852,10 +915,20 @@ class ChunkRollout:
         return build_memory_layout(
             self._geometry,
             control_frame_ranges=self._control_ranges,
+            control_step_ids=self._control_step_ids,
             control_slot_frames=(
                 self._geometry.frames_per_chunk if self._control_ranges else None
             ),
-            history_frame_ranges=self._history,
+            history_frame_ranges=(
+                self._slot_frames[: self._written_slots]
+                if self._adaptive_chunk_frames
+                else self._history
+            ),
+            history_step_ids=(
+                self._slot_steps[: self._written_slots]
+                if self._adaptive_chunk_frames
+                else None
+            ),
             history_slot_frames=self._geometry.frames_per_chunk,
             device=self._device,
         )
@@ -917,6 +990,30 @@ class ChunkRollout:
             return None
         return ar_chunk_range(self._geometry, self._frame)
 
+    def _next_range(self, frames: int | None) -> tuple[int, int] | None:
+        if frames is None or not self._adaptive_chunk_frames:
+            if (
+                frames is not None
+                and frames != self._geometry.frames_per_chunk
+            ):
+                raise ValueError(
+                    "A fixed rollout only accepts its configured "
+                    f"{self._geometry.frames_per_chunk} frames per chunk."
+                )
+            return self.next_range
+        if not 1 <= frames <= self._geometry.frames_per_chunk:
+            raise ValueError(
+                f"Adaptive chunk frames must be in [1, "
+                f"{self._geometry.frames_per_chunk}], got {frames}."
+            )
+        if self._stopped:
+            return None
+        last = self._geometry.frames_per_view
+        if last is not None and self._frame >= last:
+            return None
+        end = self._frame + frames
+        return self._frame, end if last is None else min(end, last)
+
     @property
     def is_finished(self) -> bool:
         """Whether anything is left to generate.
@@ -960,7 +1057,81 @@ class ChunkRollout:
 
         return velocity
 
-    def _top_up_control(self, needed_end: int) -> None:
+    def _write_control(
+        self, start: int, end: int, *, causal_step_id: int | None
+    ) -> None:
+        geometry = self._geometry
+        memory = self._memory()
+        control_kv = run_control_topup(
+            self._network.layers,
+            self._llm,
+            control_h=self._clean_embeddings(self._controls.tokens(start, end)),
+            control_position_ids=chunk_mrope_ids(
+                geometry,
+                chunk_start=start,
+                chunk_frames=end - start,
+                fps=self._fps,
+                temporal_offset=self._offset,
+            ),
+            text_kv=self._text_kv,
+            memory_kv=self._cache.layers(),
+            mask=_chunk_mask(
+                geometry,
+                memory,
+                text_tokens=self._num_und,
+                view_text_tokens=self._view_und,
+                pass_kind="control",
+                chunk_start=start,
+                chunk_frames=end - start,
+                causal_step_id=causal_step_id,
+                device=self._device,
+                attention_impl=self._attention_impl,
+                scope=self._scope,
+                maskless=self._maskless,
+                deduplicate_cross_view=self._deduplicate_cross_view,
+                fused_merge=self._fused_merge,
+                decomposed_temporal_window_seconds=self._window,
+                query_range=local_query_range(
+                    geometry.num_views * (end - start) * self._spatial,
+                    self._ctx,
+                ),
+            ),
+            attention_implementation=self._attention_impl,
+            native_gqa_attention=self._native_gqa_attention,
+            accelerated_rms_norm=self._accelerated_rms_norm,
+            ctx=self._ctx,
+        )
+        slot = self._cache.replace_control(control_kv)
+        assert self._control_ranges is not None
+        self._control_ranges[slot] = (start, end)
+        if self._control_step_ids is not None:
+            self._control_step_ids[slot] = causal_step_id
+        self._control_next = end
+
+    def _prune_controls(self, current_start: int) -> None:
+        if self._control_ranges is None or not self._adaptive_chunk_frames:
+            return
+        earliest = min(
+            (start for start, _end in self._history),
+            default=current_start,
+        )
+        for index, frame_range in enumerate(self._control_ranges):
+            if (
+                frame_range is not None
+                and frame_range[1] > self._geometry.condition_frames
+                and frame_range[1] <= earliest
+            ):
+                self._control_ranges[index] = None
+                assert self._control_step_ids is not None
+                self._control_step_ids[index] = None
+
+    def _top_up_control(
+        self,
+        needed_end: int,
+        *,
+        current_start: int,
+        causal_step_id: int,
+    ) -> None:
         """Bring the control window up to frame ``needed_end``, evicting as it goes.
 
         Nothing to do when the whole track was front-loaded, which is the
@@ -971,6 +1142,19 @@ class ChunkRollout:
             return
 
         geometry = self._geometry
+        if self._adaptive_chunk_frames:
+            self._prune_controls(current_start)
+            if self._control_next != current_start:
+                raise RuntimeError(
+                    f"Adaptive control is at frame {self._control_next}, "
+                    f"but generation starts at {current_start}."
+                )
+            self._write_control(
+                current_start,
+                needed_end,
+                causal_step_id=causal_step_id,
+            )
+            return
         while self._control_next < needed_end:
             # The same partition the window was built on, so a top-up replaces
             # one slot with exactly one chunk's worth of map.
@@ -978,51 +1162,7 @@ class ChunkRollout:
             if following is None:
                 break
             start, end = following
-            # Against the cache as it stands: control reads the prompt, earlier
-            # control in its own view and the clean RGB committed before it in
-            # scope, so this runs after the previous chunk's commit, and what it
-            # must not see is a slot this loop is about to replace.
-            memory = self._memory()
-            control_kv = run_control_topup(
-                self._network.layers,
-                self._llm,
-                control_h=self._clean_embeddings(self._controls.tokens(start, end)),
-                control_position_ids=chunk_mrope_ids(
-                    geometry,
-                    chunk_start=start,
-                    chunk_frames=end - start,
-                    fps=self._fps,
-                    temporal_offset=self._offset,
-                ),
-                text_kv=self._text_kv,
-                memory_kv=self._cache.layers(),
-                mask=_chunk_mask(
-                    geometry,
-                    memory,
-                    text_tokens=self._num_und,
-                    view_text_tokens=self._view_und,
-                    pass_kind="control",
-                    chunk_start=start,
-                    chunk_frames=end - start,
-                    device=self._device,
-                    attention_impl=self._attention_impl,
-                    scope=self._scope,
-                    maskless=self._maskless,
-                    deduplicate_cross_view=self._deduplicate_cross_view,
-                    fused_merge=self._fused_merge,
-                    decomposed_temporal_window_seconds=self._window,
-                    query_range=local_query_range(
-                        geometry.num_views * (end - start) * self._spatial, self._ctx
-                    ),
-                ),
-                attention_implementation=self._attention_impl,
-                native_gqa_attention=self._native_gqa_attention,
-                accelerated_rms_norm=self._accelerated_rms_norm,
-                ctx=self._ctx,
-            )
-            slot = self._cache.replace_control(control_kv)
-            self._control_ranges[slot] = (start, end)
-            self._control_next = end
+            self._write_control(start, end, causal_step_id=None)
         # The chunk after this one reads the map for frames the clip and the
         # car decide, never this chunk's pixels, so a provider that can draw
         # ahead is told to start now and has the whole denoise to do it in. Its
@@ -1034,7 +1174,7 @@ class ChunkRollout:
             prefetch(*ahead)
 
     @torch.no_grad()
-    def step(self) -> tuple[ChunkTrace, Tensor]:
+    def step(self, frames: int | None = None) -> tuple[ChunkTrace, Tensor]:
         """Generate the next chunk.
 
         Returns:
@@ -1046,7 +1186,7 @@ class ChunkRollout:
             RuntimeError: the clip is already complete, or a driver has called
                 :meth:`stop`.
         """
-        chunk = self.next_range
+        chunk = self._next_range(frames)
         if chunk is None:
             raise RuntimeError(
                 f"nothing left to generate after {self._next} of "
@@ -1058,9 +1198,14 @@ class ChunkRollout:
         geometry = self._geometry
         start, end = chunk
         frames = end - start
+        causal_step_id = self._next + 1
         count = geometry.num_views * frames * self._spatial
 
-        self._top_up_control(end)
+        self._top_up_control(
+            end,
+            current_start=start,
+            causal_step_id=causal_step_id,
+        )
         memory = self._memory()
         # One query range for every pass this chunk takes -- the denoising steps
         # and the clean replay -- because they run over the same tokens and their
@@ -1070,6 +1215,9 @@ class ChunkRollout:
         mask_args: _ChunkMaskArgs = {
             "chunk_start": start,
             "chunk_frames": frames,
+            "causal_step_id": (
+                causal_step_id if self._adaptive_chunk_frames else None
+            ),
             "device": self._device,
             "attention_impl": self._attention_impl,
             "scope": self._scope,
@@ -1235,7 +1383,25 @@ class ChunkRollout:
             accelerated_rms_norm=self._accelerated_rms_norm,
             ctx=self._ctx,
         )
-        self._slot_frames[self._cache.extend(chunk_kv)] = frames
+        slot = self._cache.extend(chunk_kv)
+        self._written_slots = min(self._written_slots + 1, self._slots)
+        self._slot_frames[slot] = frames
+        self._slot_steps[slot] = mask_args["causal_step_id"]
+        if self._adaptive_chunk_frames:
+            ordered = sorted(
+                (
+                    (frame_range[0], index, frame_range)
+                    for index, frame_range in enumerate(self._slot_frames)
+                    if frame_range is not None
+                )
+            )
+            kept = sum(end - start for _first, _index, (start, end) in ordered)
+            for _first, index, (start, end) in ordered:
+                if kept <= self._history_frames:
+                    break
+                self._slot_frames[index] = None
+                self._slot_steps[index] = None
+                kept -= end - start
 
     def latent_for(self, start: int, end: int) -> Tensor:
         """``[V, C, t, H, W]`` for frames ``[start, end)``, ready for the decoder.
@@ -1529,6 +1695,7 @@ def _chunk_mask(
     *,
     chunk_start: int,
     chunk_frames: int,
+    causal_step_id: int | None,
     text_tokens: int,
     view_text_tokens: Sequence[int] | None,
     pass_kind: ChunkPassKind,
@@ -1551,6 +1718,7 @@ def _chunk_mask(
         memory,
         chunk_start=chunk_start,
         chunk_frames=chunk_frames,
+        causal_step_id=causal_step_id,
         text_tokens=text_tokens,
         view_text_tokens=view_text_tokens,
         pass_kind=pass_kind,
@@ -1592,6 +1760,7 @@ def _prefill(
     accelerated_rms_norm: bool,
     control_ranges: Sequence[tuple[int, int]] | None = None,
     control_slot_frames: int | None = None,
+    control_slot_count: int | None = None,
     scope: AttentionScope = "all_views",
     maskless: bool = False,
     deduplicate_cross_view: bool = False,
@@ -1719,6 +1888,7 @@ def _prefill(
             control_ranges=pack.control_ranges,
             tokens_per_frame=geometry.num_views * geometry.spatial_tokens,
             slot_frames=control_slot_frames,
+            slot_count=control_slot_count,
         )
     return text_kv, memory_kv, num_und, offset
 

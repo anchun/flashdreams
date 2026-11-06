@@ -33,6 +33,7 @@ class EventBuffer:
         # window's own start, so they cannot be compared with presentation time.
         self._received_ns: list[int] = []
         self._last_read_received_ns: dict[int, list[int]] = {}
+        self._last_read_events: dict[int, list[UserInputEvent]] = {}
         self._base_index = 0
         self._reader_indexes: dict[int, int] = {}
         self._generation = 0
@@ -75,6 +76,7 @@ class EventBuffer:
             event_index = self._reader_indexes.setdefault(reader_id, self._base_index)
             relative_index = event_index - self._base_index
             events = list(self._events[relative_index:])
+            self._last_read_events[reader_id] = events
             self._last_read_received_ns[reader_id] = self._received_ns[relative_index:]
             self._reader_indexes[reader_id] = self._base_index + len(self._events)
             return UserInputEvents(events), self._generation
@@ -88,10 +90,29 @@ class EventBuffer:
         with self._lock:
             return list(self._last_read_received_ns.get(reader_id, []))
 
+    def last_read_timed_events(
+        self, reader_id: int
+    ) -> list[tuple[UserInputEvent, int]]:
+        """Return the last read's events paired with their runtime arrival times.
+
+        Pairs retain arrival order. :class:`UserInputEvents` sorts by client
+        timestamp for simulation, but latency filtering must keep each event
+        attached to the server timestamp recorded for it.
+        """
+        with self._lock:
+            return list(
+                zip(
+                    self._last_read_events.get(reader_id, []),
+                    self._last_read_received_ns.get(reader_id, []),
+                    strict=True,
+                )
+            )
+
     def unregister(self, reader_id: int) -> None:
         """Stop retaining events for ``reader_id``."""
         with self._lock:
             self._reader_indexes.pop(reader_id, None)
+            self._last_read_events.pop(reader_id, None)
             self._last_read_received_ns.pop(reader_id, None)
 
     def collect_garbage(self) -> int:
@@ -114,6 +135,7 @@ class EventBuffer:
             self._events.clear()
             self._received_ns.clear()
             self._reader_indexes.clear()
+            self._last_read_events.clear()
             self._last_read_received_ns.clear()
             self._base_index = 0
 

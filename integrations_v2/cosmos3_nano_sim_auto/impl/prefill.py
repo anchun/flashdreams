@@ -293,6 +293,7 @@ def pad_control_slots(
     control_ranges: Sequence[tuple[int, int]],
     tokens_per_frame: int,
     slot_frames: int,
+    slot_count: int | None = None,
 ) -> list[LayerKV]:
     """Spread the prefilled control sections over fixed-width cache slots.
 
@@ -313,7 +314,12 @@ def pad_control_slots(
     if all(section == slot_tokens for section in sections):
         return list(memory_kv)
 
-    control_tokens = len(sections) * slot_tokens
+    slot_count = len(sections) if slot_count is None else slot_count
+    if slot_count < len(sections):
+        raise ValueError(
+            f"{len(sections)} control ranges do not fit {slot_count} slots."
+        )
+    control_tokens = slot_count * slot_tokens
     padded: list[LayerKV] = []
     for k, v in memory_kv:
         rest = int(k.shape[2]) - sum(sections)

@@ -243,6 +243,11 @@ class _KVCache:
         """Tokens written so far."""
         return self._length
 
+    @property
+    def full(self) -> bool:
+        """Whether every reusable history slot has been committed."""
+        return self._length == self._capacity
+
     def layers(self) -> list[LayerKV]:
         """Per-layer ``(k, v)`` views over the written tokens."""
         return [
@@ -559,10 +564,6 @@ class ChunkRollout:
             raise ValueError(
                 "adaptive_chunk_frames requires a bounded history_frames window"
             )
-        if adaptive_chunk_frames and compile_denoise is not None:
-            raise ValueError(
-                "adaptive_chunk_frames cannot be combined with compile_denoise"
-            )
         if adaptive_chunk_frames and attention_kv_arena:
             raise ValueError(
                 "adaptive_chunk_frames cannot be combined with attention_kv_arena"
@@ -707,16 +708,27 @@ class ChunkRollout:
         self._fused_merge = fused_attention_merge
         self._window = decomposed_temporal_window_seconds
         self._adaptive_chunk_frames = adaptive_chunk_frames
-        # Built here rather than per chunk: compiling is only worth its cost if
-        # one compilation serves every chunk.
         self._flow = _flow_fn(
             network,
             native_gqa_attention=native_gqa_attention,
             attention_impl=self._attention_impl,
             accelerated_rms_norm=accelerated_rms_norm,
-            compile_denoise=compile_denoise,
+            compile_denoise=None,
             rig_view_ids=geometry.rig_view_ids,
             ctx=self._ctx,
+        )
+        self._compiled_flow = (
+            self._flow
+            if compile_denoise is None
+            else _flow_fn(
+                network,
+                native_gqa_attention=native_gqa_attention,
+                attention_impl=self._attention_impl,
+                accelerated_rms_norm=accelerated_rms_norm,
+                compile_denoise=compile_denoise,
+                rig_view_ids=geometry.rig_view_ids,
+                ctx=self._ctx,
+            )
         )
 
         committed = plan.committed_frames
@@ -1034,7 +1046,7 @@ class ChunkRollout:
         self._stopped = True
 
     def _velocity_fn(
-        self, positions: Tensor, noisy_mask: ChunkMask
+        self, positions: Tensor, noisy_mask: ChunkMask, *, compiled: bool
     ) -> Callable[[Tensor, Tensor], Tensor]:
         """The sampler's callback: one noisy pass, its flow returned unchanged."""
         memory_kv = self._cache.layers()
@@ -1044,7 +1056,7 @@ class ChunkRollout:
         )
 
         def velocity(latent: Tensor, timestep: Tensor) -> Tensor:
-            return self._flow(
+            return (self._compiled_flow if compiled else self._flow)(
                 latent,
                 timestep,
                 positions,
@@ -1252,7 +1264,11 @@ class ChunkRollout:
         # step. And the noise is then drawn from the clip's seeds rather than the
         # mesh's, which is what lets a sharded run be compared against a
         # single-rank one at all.
-        velocity = self._velocity_fn(positions, noisy_mask)
+        velocity = self._velocity_fn(
+            positions,
+            noisy_mask,
+            compiled=not self._adaptive_chunk_frames or self._cache.full,
+        )
         patch = self._vfm.latent_patch_size
         latent_hw = geometry.latent_hw(patch)
         padded = latent_hw != (geometry.patch_h * patch, geometry.patch_w * patch)

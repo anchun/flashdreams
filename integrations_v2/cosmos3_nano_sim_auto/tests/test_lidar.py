@@ -115,7 +115,7 @@ def make_rollout(
         condition_tokens=condition,
         lidar_condition=lidar_condition,
         t_list=[1.0, 0.5],
-        history_frames=3,
+        history_frames=options.pop("history_frames", 3),
         **options,
     )
     return rollout
@@ -177,6 +177,56 @@ def test_joint_compiled_denoise_runs_steady_chunks_compiled(monkeypatch):
             compile_denoise="default",
             parallel=replace(ParallelContext.single("cpu"), tp_size=2),
         )
+
+
+def test_joint_adaptive_chunks_keep_dynamic_boundaries_and_frame_budget() -> None:
+    rollout = make_rollout(
+        conditioned=True,
+        adaptive_chunk_frames=True,
+        history_frames=4,
+    )
+
+    traces = [rollout.step(0)[0]]
+    for frames in (1, 1, 3, 1, 3):
+        traces.append(rollout.step(frames)[0])
+        assert rollout._history_frame_count <= 4
+
+    assert [(trace.start, trace.end) for trace in traces] == [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 6),
+        (6, 7),
+        (7, 10),
+    ]
+    assert [entry[2] for entry in rollout.history] == [1, 3]
+    fields, _ = rollout._memory()
+    assert set(fields.causal_step_id.tolist()) == {0, 4, 5}
+
+
+def test_joint_adaptive_compile_waits_for_a_full_frame_budget(monkeypatch) -> None:
+    calls = []
+
+    def compile_fn(fn, *, mode):
+        assert mode is None
+        return lambda *args, **kwargs: calls.append(fn.__name__) or fn(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "compile", compile_fn)
+    rollout = make_rollout(
+        conditioned=True,
+        frames=8,
+        adaptive_chunk_frames=True,
+        compile_denoise="default",
+        history_frames=3,
+    )
+
+    rollout.step(0)
+    for _ in range(3):
+        rollout.step(1)
+    assert calls == []
+
+    rollout.step(1)
+    assert calls == ["_collect", "_forward", "_forward", "_collect"]
 
 
 def test_lidar_patch_order_padding_and_roundtrip():

@@ -712,7 +712,12 @@ def test_the_batch_commands_pipelining_flags_reach_the_drives_settings(
     app.init(
         ["--scene", str(tmp_path), "--no-ui", "--parallel-decode", "--decoder-compile"]
         + ["--compile-denoise", "max-autotune", "--compile-control-encode"]
-        + ["--prefetch-controls", "--prefetch-controls-gpu-offset", "2"]
+        + [
+            "--no-adaptive-control-chunks",
+            "--prefetch-controls",
+            "--prefetch-controls-gpu-offset",
+            "2",
+        ]
     )
     assert isinstance(app._backend, MultiViewRenderBackend)
     settings = app._backend._settings
@@ -723,33 +728,53 @@ def test_the_batch_commands_pipelining_flags_reach_the_drives_settings(
     assert settings.prefetch_controls_gpu_offset == 2
 
 
-def test_adaptive_control_chunks_reach_the_backend(tmp_path: Path) -> None:
+def test_adaptive_control_chunks_are_default_and_can_be_disabled(tmp_path: Path) -> None:
     from cosmos3_nano_sim_auto.apps.interactive_drive.adapter import (
         CosmosInteractiveDriveApplication,
     )
 
     app = CosmosInteractiveDriveApplication(settings=MultiViewSettings())
-    app.init(
+    app.init(["--scene", str(tmp_path), "--no-ui", "--chunk-frames", "3"])
+
+    assert isinstance(app._backend, MultiViewRenderBackend)
+    assert app._backend._settings.adaptive_control_chunks
+
+    disabled = CosmosInteractiveDriveApplication(settings=MultiViewSettings())
+    disabled.init(
         [
             "--scene",
             str(tmp_path),
             "--no-ui",
-            "--chunk-frames",
-            "3",
-            "--adaptive-control-chunks",
+            "--no-adaptive-control-chunks",
         ]
     )
+    assert isinstance(disabled._backend, MultiViewRenderBackend)
+    assert not disabled._backend._settings.adaptive_control_chunks
 
-    assert isinstance(app._backend, MultiViewRenderBackend)
-    assert app._backend._settings.adaptive_control_chunks
+
+def test_adaptive_lidar_keeps_the_conditioned_opening_frame() -> None:
+    backend = MultiViewRenderBackend(
+        ChunkConfig(),
+        RasterConfig(),
+        settings=MultiViewSettings(lidar_checkpoint=Path("codec.safetensors")),
+    )
+    backend._first_chunk_frames = 1
+
+    assert (
+        backend.next_chunk_frames(
+            DriverCommand(),
+            control_changed=False,
+            first_chunk=True,
+            now_s=0.0,
+        )
+        == 1
+    )
 
 
 @pytest.mark.parametrize(
     "extra, message",
     [
-        (["--chunk-frames", "1"], "greater than 1"),
         (["--prefetch-controls"], "prefetch-controls"),
-        (["--compile-denoise", "default"], "compile-denoise"),
     ],
 )
 def test_adaptive_control_chunks_refuse_incompatible_options(
@@ -775,6 +800,31 @@ def test_adaptive_control_chunks_refuse_incompatible_options(
         )
 
     assert message in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("extra", [["--lidar"], ["--compile-denoise", "default"]])
+def test_adaptive_control_chunks_accept_lidar_and_compilation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    extra: list[str],
+) -> None:
+    from cosmos3_nano_sim_auto.apps.interactive_drive.adapter import (
+        CosmosInteractiveDriveApplication,
+    )
+
+    if extra == ["--lidar"]:
+        from cosmos3_nano_sim_auto import checkpoint
+
+        monkeypatch.setattr(
+            checkpoint,
+            "resolve_lidar_checkpoint",
+            lambda *args, **kwargs: tmp_path / "codec.safetensors",
+        )
+    app = CosmosInteractiveDriveApplication(settings=MultiViewSettings())
+    app.init(["--scene", str(tmp_path), "--no-ui", *extra])
+
+    assert isinstance(app._backend, MultiViewRenderBackend)
+    assert app._backend._settings.adaptive_control_chunks
 
 
 @pytest.mark.parametrize(
@@ -958,7 +1008,7 @@ def test_a_worker_rank_decodes_its_own_cameras_and_presents_nothing(
     )
     backend._poses = backend._drawn = SimpleNamespace(supply=lambda poses: None)
     backend._rollout = SimpleNamespace(
-        step=lambda: (SimpleNamespace(start=1, end=4), None),
+        step=lambda frames=None: (SimpleNamespace(start=1, end=4), None),
         latent_for=lambda start, end: torch.zeros(1),
     )
     backend._decode = lambda latent: latent

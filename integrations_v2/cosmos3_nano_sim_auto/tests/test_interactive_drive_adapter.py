@@ -237,6 +237,7 @@ def test_experimental_chunk_frames_reaches_the_interactive_backend(tmp_path):
 
     assert isinstance(app._backend, MultiViewRenderBackend)
     assert app._backend._settings.frames_per_chunk == 1
+    assert not app._backend._settings.adaptive_control_chunks
 
 
 @pytest.mark.parametrize("value,expected", [("2", 2), ("0", None)])

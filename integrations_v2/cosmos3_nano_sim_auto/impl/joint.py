@@ -166,6 +166,7 @@ class JointChunkRollout:
         decomposed_temporal_window_seconds=0.4,
         fused_attention_merge=False,
         compile_denoise=None,
+        adaptive_chunk_frames=False,
     ):
         if not hasattr(network, "lidar2llm") or not hasattr(network, "llm2lidar"):
             raise ValueError(
@@ -247,6 +248,7 @@ class JointChunkRollout:
             decomposed_temporal_window_seconds,
             fused_attention_merge,
         )
+        self._adaptive_chunk_frames = adaptive_chunk_frames
         self._camera_ids = (
             torch.tensor(geometry.rig_view_ids, device=self.device)
             if self._deduplicate_cross_view
@@ -268,8 +270,10 @@ class JointChunkRollout:
         self.condition = condition_tokens
         self.lidar_condition = lidar_condition
         self._frame, self.chunks_done, self._stopped = 0, 0, False
+        self._history_frames = history_frames
+        self._history_frame_count = 0
         self.warmup_chunks = math.ceil(history_frames / geometry.frames_per_chunk) + 1
-        self.history = deque(maxlen=self.warmup_chunks - 1)
+        self.history = deque()
         self.sink = None
         self.last_rgb = None
         self.last_lidar = None
@@ -302,7 +306,7 @@ class JointChunkRollout:
         # Recorded LiDAR controls are known in full, so a provider that can is
         # asked to encode them ahead rather than inside every chunk.
         preencode = getattr(lidar_controls, "preencode", None)
-        if preencode is not None:
+        if preencode is not None and not adaptive_chunk_frames:
             preencode(self._sweep_ranges())
 
     def _sweep_ranges(self):
@@ -324,6 +328,8 @@ class JointChunkRollout:
 
     @property
     def chunk_count(self):
+        if self._adaptive_chunk_frames:
+            return None
         n = self.geometry.frames_per_view
         return (
             None
@@ -335,6 +341,31 @@ class JointChunkRollout:
     def next_range(self):
         return None if self._stopped else ar_chunk_range(self.geometry, self._frame)
 
+    def _next_range(self, frames):
+        if self._stopped:
+            return None
+        if self._frame == 0:
+            if frames not in (None, 0, 1):
+                raise ValueError("The opening joint chunk contains one frame")
+            return ar_chunk_range(self.geometry, self._frame)
+        if frames is None or not self._adaptive_chunk_frames:
+            if frames is not None and frames != self.geometry.frames_per_chunk:
+                raise ValueError(
+                    "A fixed joint rollout only accepts its configured "
+                    f"{self.geometry.frames_per_chunk} frames per chunk."
+                )
+            return self.next_range
+        if not 1 <= frames <= self.geometry.frames_per_chunk:
+            raise ValueError(
+                f"Adaptive chunk frames must be in [1, "
+                f"{self.geometry.frames_per_chunk}], got {frames}."
+            )
+        last = self.geometry.frames_per_view
+        if last is not None and self._frame >= last:
+            return None
+        end = self._frame + frames
+        return self._frame, end if last is None else min(end, last)
+
     @property
     def is_finished(self):
         return self.next_range is None
@@ -342,30 +373,44 @@ class JointChunkRollout:
     def stop(self):
         self._stopped = True
 
-    def _fields(self, start, end, *, lidar, role):
+    def _fields(self, start, end, *, lidar, role, step_id=None):
         if not lidar:
             frame, view = _stamp_view_major(
                 torch.arange(start, end, device=self.device),
                 self.geometry.num_views,
                 self.geometry.spatial_tokens,
             )
-            return _vision(
+            fields = _vision(
                 frame,
                 view,
                 role=role,
                 is_noisy=role == ROLE_CURRENT_TARGET,
                 geometry=self.geometry,
             )
+            return (
+                fields
+                if step_id is None
+                else replace(
+                    fields,
+                    causal_step_id=torch.full_like(fields.causal_step_id, step_id),
+                )
+            )
         g = self.tokenizer.geometry
         frame = torch.arange(start, end, device=self.device).repeat_interleave(
             g.spatial_tokens
         )
         timestamp = frame.float() / g.fps
-        step = torch.ceil(
-            timestamp
-            / (self.geometry.frames_per_chunk * self.geometry.seconds_per_frame)
-            - 1e-5
-        ).long()
+        if step_id is None:
+            step = torch.ceil(
+                timestamp
+                / (
+                    self.geometry.frames_per_chunk
+                    * self.geometry.seconds_per_frame
+                )
+                - 1e-5
+            ).long()
+        else:
+            step = torch.full_like(frame, step_id)
         return StreamFields(
             torch.zeros_like(frame),
             frame,
@@ -554,16 +599,16 @@ class JointChunkRollout:
         return (fields, collector(rgb, lidar, positions, view_ids, mem_kv, plan))
 
     @torch.inference_mode()
-    def step(self):
-        bounds = self.next_range
+    def step(self, frames=None):
+        bounds = self._next_range(frames)
         if bounds is None:
             raise RuntimeError("Joint rollout is complete")
         start, end = bounds
-        # Compiled only for a full chunk against a full history; the opening
-        # chunk, the chunks filling the history and a short final one run eager.
-        self._steady = (
-            end - start == self.geometry.frames_per_chunk
-            and len(self.history) == self.history.maxlen
+        # Compile only against a full history. The opening and history-filling
+        # chunks run eager; fixed rollouts also keep a short final chunk eager.
+        self._steady = self._history_frame_count == self._history_frames and (
+            self._adaptive_chunk_frames
+            or end - start == self.geometry.frames_per_chunk
         )
         lo, hi = sweep_range(
             start, end, geometry=self.geometry, lidar_fps=self.tokenizer.geometry.fps
@@ -578,11 +623,15 @@ class JointChunkRollout:
             self._positions(lo, hi, lidar=True),
         )
 
+        step_id = self.chunks_done
+
         def rf(role):
-            return self._fields(start, end, lidar=False, role=role)
+            return self._fields(
+                start, end, lidar=False, role=role, step_id=step_id
+            )
 
         def lf(role):
-            return self._fields(lo, hi, lidar=True, role=role)
+            return self._fields(lo, hi, lidar=True, role=role, step_id=step_id)
 
         # Start the RGB map worker (if any) on this chunk, then the LiDAR ranks'
         # render/encode, both before the camera collectives so they overlap.
@@ -598,7 +647,7 @@ class JointChunkRollout:
         metrics = {"rgb_control_encode_s": elapsed}
         # As in ChunkRollout: a provider that can draw ahead starts the next
         # chunk's controls now and has the whole denoise to finish them.
-        ahead = ar_chunk_range(g, end)
+        ahead = None if self._adaptive_chunk_frames else ar_chunk_range(g, end)
         prefetch = getattr(self.controls, "prefetch", None)
         if ahead is not None and prefetch is not None:
             prefetch(*ahead)
@@ -735,7 +784,12 @@ class JointChunkRollout:
             if start == 0:
                 self.sink = combined
             else:
-                self.history.append(combined)
+                frames_in_chunk = end - start
+                self.history.append((*combined, frames_in_chunk))
+                self._history_frame_count += frames_in_chunk
+                while self._history_frame_count > self._history_frames:
+                    dropped = self.history.popleft()
+                    self._history_frame_count -= dropped[2]
         metrics["joint_clean_cache_s"] = elapsed
         self.last_rgb = rgb.reshape(g.num_views, end - start, g.spatial_tokens, -1)
         self.last_lidar_range = (lo, hi)

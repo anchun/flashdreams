@@ -119,10 +119,10 @@ Start with one front-wide view:
 uv run --no-sync flashdreams-run-v2 interactive-drive-cosmos3-nano-sim-auto \
   --mode webrtc --host 0.0.0.0 --port 8080
 
-# keep three-latent chunks while idle, but switch to one latent while driving
+# adaptive chunks are the default: three latents idle, one while driving
 uv run --no-sync flashdreams-run-v2 interactive-drive-cosmos3-nano-sim-auto \
   --mode websocket --host 0.0.0.0 --port 60089 -- \
-  --chunk-frames 3 --adaptive-control-chunks
+  --chunk-frames 3
 
 # run with two GPUs and set chunk-frames 1 and denoise steps
 export CUDA_VISIBLE_DEVICES=0,1
@@ -149,18 +149,22 @@ latent frames per chunk with four denoising steps. Fewer denoising steps use a
 coarser final jump to clean and can reduce detail and long-rollout stability;
 `--denoise-steps 0` restores the checkpoint's full four-step schedule.
 
-`--adaptive-control-chunks` keeps the configured `--chunk-frames` while input is
-idle, switches to one latent (four pixel frames) whenever throttle, brake,
-steering or reverse is active, and stays at one latent for three seconds after
-the last input transition. This gives later changes during an active driving
-sequence the same chunk boundary cadence as `--chunk-frames 1`, then returns to
-the checkpoint's three-latent quality setting automatically. An input that
-arrives after an idle three-latent chunk has already started cannot interrupt
-that in-flight generation; it takes effect when the next chunk starts.
+Adaptive control chunks are enabled by default. They keep the configured
+`--chunk-frames` while input is idle, switch to one latent (four pixel frames)
+whenever throttle, brake, steering or reverse is active, and stay at one latent
+for three seconds after the last input transition. This gives later changes
+during an active driving sequence the same chunk boundary cadence as
+`--chunk-frames 1`, then returns to the checkpoint's three-latent quality
+setting automatically. An input that arrives after an idle three-latent chunk
+has already started cannot interrupt that in-flight generation; it takes effect
+when the next chunk starts. Use `--no-adaptive-control-chunks` to keep a fixed
+chunk size.
 
-Adaptive control chunks are currently RGB-only and require
-`--chunk-frames 2` or greater. They cannot be combined with
-`--prefetch-controls` or `--compile-denoise`; both assume a fixed chunk shape.
+Adaptive control chunks support RGB, joint RGB+LiDAR generation, and
+`--compile-denoise`. Compilation stays eager while the bounded history cache is
+filling, then compiles each stable short or long shape on first use. They remain
+incompatible with `--prefetch-controls`, because controls drawn before the next
+input arrives cannot follow its newly selected chunk boundary.
 When profiling Interactive Drive, `input.latency` counts effective driving
 transitions; repeated browser snapshots of an already-held or already-released
 key are excluded.

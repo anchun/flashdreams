@@ -699,7 +699,7 @@ def run_to_end(rollout: ChunkRollout) -> torch.Tensor:
     return rollout.result().latent
 
 
-def adaptive() -> ChunkRollout:
+def adaptive(**options) -> ChunkRollout:
     geometry = ClipGeometry(
         num_views=2,
         frames_per_view=10,
@@ -722,6 +722,7 @@ def adaptive() -> ChunkRollout:
         ),
         history_frames=3,
         adaptive_chunk_frames=True,
+        **options,
     )
 
 
@@ -769,6 +770,26 @@ def test_adaptive_chunks_reject_invalid_sizes() -> None:
         rollout.step(4)
 
 
+def test_adaptive_chunks_compile_after_the_cache_shape_stabilizes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    def compile_fn(fn, *, mode):
+        assert mode is None
+        return lambda *args, **kwargs: calls.append(fn.__name__) or fn(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "compile", compile_fn)
+    rollout = adaptive(compile_denoise="default")
+
+    for _ in range(3):
+        rollout.step(1)
+    assert calls == []
+
+    rollout.step(1)
+    assert calls
+
+
 def test_adaptive_chunks_reject_fixed_shape_optimizations() -> None:
     geometry = dataclasses.replace(ROLLING, frames_per_chunk=3)
     _controls, text_ids = inputs()
@@ -788,8 +809,6 @@ def test_adaptive_chunks_reject_fixed_shape_optimizations() -> None:
         "adaptive_chunk_frames": True,
     }
 
-    with pytest.raises(ValueError, match="compile_denoise"):
-        ChunkRollout(build(), compile_denoise="default", **kwargs)
     with pytest.raises(ValueError, match="attention_kv_arena"):
         ChunkRollout(build(), attention_kv_arena=True, **kwargs)
 

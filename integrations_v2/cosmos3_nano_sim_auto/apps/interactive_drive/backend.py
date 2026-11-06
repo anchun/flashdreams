@@ -178,7 +178,7 @@ class MultiViewSettings:
     LiDAR, only this chunk's, once the host has supplied its poses."""
     prefetch_controls_gpu_offset: int = 0
     """The worker's GPU: this rank's index plus this, modulo the node's count."""
-    adaptive_control_chunks: bool = False
+    adaptive_control_chunks: bool = True
     """Use one latent while controls are active, then restore the configured
     stable chunk three seconds after the last control transition."""
 
@@ -213,6 +213,11 @@ class MultiViewRenderBackend(RenderBackend):
     ) -> None:
         super().__init__(chunk, raster)
         self._settings = settings or MultiViewSettings()
+        if (
+            self._settings.adaptive_control_chunks
+            and self._settings.frames_per_chunk == 1
+        ):
+            self._settings = replace(self._settings, adaptive_control_chunks=False)
         if self._settings.lidar_fps is None:
             self._settings = replace(
                 self._settings,
@@ -242,27 +247,14 @@ class MultiViewRenderBackend(RenderBackend):
                 "the original clock."
             )
         if self._settings.adaptive_control_chunks:
-            if self._settings.frames_per_chunk <= 1:
-                raise ValueError(
-                    "--adaptive-control-chunks requires --chunk-frames greater than 1"
-                )
             if self._settings.condition_frames != 1:
                 raise ValueError(
                     "--adaptive-control-chunks requires one opening frame"
-                )
-            if self._settings.lidar_checkpoint is not None:
-                raise ValueError(
-                    "--adaptive-control-chunks is currently RGB-only"
                 )
             if self._settings.prefetch_controls:
                 raise ValueError(
                     "--adaptive-control-chunks cannot be combined with "
                     "--prefetch-controls"
-                )
-            if self._settings.compile_denoise is not None:
-                raise ValueError(
-                    "--adaptive-control-chunks cannot be combined with "
-                    "--compile-denoise"
                 )
         mesh = self._settings.parallel
         # Refused here, before 28 GiB of weights load, rather than by the rollout.
@@ -329,6 +321,8 @@ class MultiViewRenderBackend(RenderBackend):
     ) -> int:
         if not self._settings.adaptive_control_chunks:
             return self.initial_chunk_frames if first_chunk else self.chunk_frames
+        if first_chunk and self._settings.lidar_checkpoint is not None:
+            return self.initial_chunk_frames
         if control_changed:
             self._response_until_s = now_s + 3.0
         active = (
@@ -869,6 +863,7 @@ class MultiViewRenderBackend(RenderBackend):
                 lidar_tokenizer=self._lidar.assets.tokenizer,
                 lidar_condition=self._lidar.condition_tokens(),
                 compile_denoise=settings.compile_denoise,
+                adaptive_chunk_frames=settings.adaptive_control_chunks,
             )
         else:
             self._rollout = ChunkRollout(
